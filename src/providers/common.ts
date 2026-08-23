@@ -1,5 +1,5 @@
 /**
- * Plumbing shared by the three subscription adapters: HTTP error mapping, a
+ * Plumbing shared by the subscription adapters: HTTP error mapping, a
  * stream idle watchdog, fetch failure classification, OAuth endpoint errors,
  * and the per-provider {@link TokenManager} that owns session freshness.
  * Concurrent refreshes for one provider coalesce behind a single in-flight

@@ -59,6 +59,8 @@ export function withToolResultImages(messages: readonly TranslatableMessage[]): 
 export interface TranslatableMessage {
   role: 'system' | 'user' | 'assistant'
   content: readonly TranslatableBlock[]
+  /** Preserved for adapters whose provider-private replay metadata is required. */
+  source?: Message['source']
 }
 
 /**
@@ -108,6 +110,7 @@ export async function resolveImages(
   }
   return Promise.all(messages.map(async (message): Promise<TranslatableMessage> => ({
     role: message.role,
+    source: message.source,
     content: (await Promise.all(message.content.map(resolveBlock))).flat(),
   })))
 }

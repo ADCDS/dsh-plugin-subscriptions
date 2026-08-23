@@ -19,10 +19,10 @@ import { dirname } from 'node:path'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 
 /** Provider routes this plugin can serve. */
-export type ProviderId = 'codex' | 'claude' | 'grok' | 'copilot'
+export type ProviderId = 'codex' | 'claude' | 'grok' | 'copilot' | 'antigravity'
 
 /** Every provider route, in display order. */
-export const PROVIDER_IDS: readonly ProviderId[] = ['codex', 'claude', 'grok', 'copilot']
+export const PROVIDER_IDS: readonly ProviderId[] = ['codex', 'claude', 'grok', 'copilot', 'antigravity']
 
 /** Stored ChatGPT/Codex subscription session. */
 export interface CodexSession {
@@ -87,6 +87,22 @@ export interface CopilotSession {
   account?: string
 }
 
+/** Stored Google OAuth session for the Antigravity v1internal API. */
+export interface AntigravitySession {
+  accessToken: string
+  refreshToken: string
+  /** Epoch milliseconds at which the Google access token expires. */
+  expiresAt: number
+  /** Cloud AI Companion project required by Antigravity request envelopes. */
+  projectId: string
+  /** Google account email, for the status display. */
+  account?: string
+  /** Subscription tier observed during project discovery. */
+  plan?: string
+  /** Granted Google OAuth scopes, when the token endpoint returned them. */
+  scopes?: string
+}
+
 /** One provider's accounts: account key → session, plus the default account. */
 export interface ProviderAccounts<S> {
   /** Key of the account direct (non-pool) routes serve; the first login wins. */
@@ -100,10 +116,11 @@ export interface SessionMap {
   claude?: ProviderAccounts<ClaudeSession>
   grok?: ProviderAccounts<GrokSession>
   copilot?: ProviderAccounts<CopilotSession>
+  antigravity?: ProviderAccounts<AntigravitySession>
 }
 
 /** Any stored session, for provider-agnostic plumbing. */
-export type StoredSession = CodexSession | ClaudeSession | GrokSession | CopilotSession
+export type StoredSession = CodexSession | ClaudeSession | GrokSession | CopilotSession | AntigravitySession
 
 /** The session type one provider stores. */
 export type SessionOf<K extends ProviderId> = NonNullable<SessionMap[K]>['accounts'][string]
@@ -135,6 +152,8 @@ export function accountKeyOf(provider: ProviderId, session: StoredSession): stri
       return (session as ClaudeSession).emailAddress ?? tokenHash(session.refreshToken)
     case 'grok':
       return (session as GrokSession).account ?? tokenHash(session.refreshToken)
+    case 'antigravity':
+      return (session as AntigravitySession).account ?? tokenHash(session.refreshToken)
     case 'copilot':
       return (session as CopilotSession).account ?? tokenHash(session.refreshToken)
   }
@@ -169,6 +188,12 @@ function assertSessionShape(provider: ProviderId, account: string, value: unknow
     || typeof entry.expiresAt !== 'number' || !Number.isFinite(entry.expiresAt)) {
     throw new Error(
       `subscriptions auth store: entry "${provider}/${account}" is missing accessToken/refreshToken/expiresAt; fix or delete the store file`,
+    )
+  }
+  if (provider === 'antigravity'
+    && (typeof entry.projectId !== 'string' || entry.projectId.length === 0)) {
+    throw new Error(
+      'subscriptions auth store: entry "antigravity" is missing projectId; log out and complete Antigravity login again',
     )
   }
 }
