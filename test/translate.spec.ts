@@ -150,8 +150,8 @@ test('toResponsesInput: reasoningFor replays completed reasoning items ahead of 
 })
 
 test('toResponsesTools maps to Responses function tools', () => {
-  assert.deepEqual(toResponsesTools([{ name: 'bash', description: 'run', parameters: { type: 'object' } }]), [
-    { type: 'function', name: 'bash', description: 'run', parameters: { type: 'object' } },
+  assert.deepEqual(toResponsesTools([{ name: 'bash', description: 'run', parameters: { type: 'object' } }], { strict: false }), [
+    { type: 'function', name: 'bash', description: 'run', parameters: { type: 'object' }, strict: false },
   ])
 })
 

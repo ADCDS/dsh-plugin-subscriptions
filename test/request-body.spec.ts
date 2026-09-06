@@ -11,6 +11,7 @@ import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
 import { MessageId } from '@deepseek-ai/dsh-llm'
 import { codexRequestBody, CodexAdapter, CODEX_API_URL } from '../src/providers/codex.js'
 import { grokRequestBody, GrokAdapter, GROK_API_URL } from '../src/providers/grok.js'
+import { copilotResponsesRequestBody } from '../src/providers/copilot.js'
 import { AccountTokenManager } from '../src/providers/accounts.js'
 import { toResponsesInput } from '../src/translate/responses.js'
 
@@ -32,6 +33,36 @@ function options(tools?: GenerateOptions['tools']): GenerateOptions {
 }
 
 const resolved = toResponsesInput([], 'judge')
+
+test('Responses providers preserve optional escalation fields and apply strict opt-out only where intended', () => {
+  const parameters = {
+    type: 'object',
+    properties: {
+      command: { type: 'string' },
+      description: { type: 'string' },
+      sandbox_permissions: { type: 'string', enum: ['workspace-write', 'danger-full-access'] },
+      justification: { type: 'string' },
+    },
+    required: ['command', 'description'],
+  }
+  const original = structuredClone(parameters)
+  const tool = { name: 'bash', description: 'Run a command', parameters }
+  const request = options([tool])
+  const bodies = [
+    ['codex', codexRequestBody(request, resolved, false)],
+    ['copilot', copilotResponsesRequestBody(request, resolved)],
+    ['grok', grokRequestBody(request, resolved)],
+  ] as const
+  for (const [provider, body] of bodies) {
+    const [mapped] = body.tools as Record<string, unknown>[]
+    assert.deepEqual(mapped.parameters, original, `${provider}: preserve optional, non-nullable fields`)
+    assert.deepEqual(mapped, {
+      type: 'function', name: 'bash', description: 'Run a command', parameters: original,
+      ...provider === 'grok' ? {} : { strict: false },
+    }, `${provider}: strict policy belongs to the provider`)
+  }
+  assert.deepEqual(parameters, original, 'request assembly must not mutate the harness schema')
+})
 
 test('grok: tool-less request carries no tool_choice / parallel_tool_calls', () => {
   const body = grokRequestBody(options(), resolved)

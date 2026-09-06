@@ -163,15 +163,25 @@ export function toResponsesInput(
 
 /**
  * Map harness tool schemas to Responses function tools.
+ *
+ * OpenAI Responses may normalize schemas into strict mode when `strict` is
+ * omitted. Codex and Copilot opt out to preserve harness optional parameters;
+ * this does not prevent a model from voluntarily supplying optional fields.
+ * Other providers keep their existing defaults unless explicitly opted out.
  * @param tools - tool schemas from the request.
+ * @param options - provider-specific opt-out from strict schema normalization.
  * @returns Responses `tools` array entries.
  */
-export function toResponsesTools(tools: readonly ToolSchema[]): Record<string, unknown>[] {
+export function toResponsesTools(
+  tools: readonly ToolSchema[],
+  options: { strict?: false } = {},
+): Record<string, unknown>[] {
   return tools.map(tool => ({
     type: 'function',
     name: tool.name,
     description: tool.description,
     parameters: tool.parameters,
+    ...options.strict === undefined ? {} : { strict: options.strict },
   }))
 }
 

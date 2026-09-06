@@ -652,7 +652,7 @@ export function codexRequestBody(
     // This is request-shape consistency, not a claim that Codex rejects the
     // controls when no tools are supplied.
     ...options.tools !== undefined && options.tools.length > 0
-      ? { tools: toResponsesTools(options.tools), tool_choice: 'auto', parallel_tool_calls: true }
+      ? { tools: toResponsesTools(options.tools, { strict: false }), tool_choice: 'auto', parallel_tool_calls: true }
       : {},
     ...options.reasoningEffort !== undefined
       ? { reasoning: { effort: String(options.reasoningEffort), summary: 'auto' } }
