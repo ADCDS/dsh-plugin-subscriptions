@@ -61,6 +61,11 @@ Also included, registered when the matching provider is enabled:
 - **`image_generate`** tool (ChatGPT or Grok) — `gpt-image-2` via the Codex backend, or `grok-imagine-image-2.0` via `api.x.ai/v1/images/generations`. The `provider` argument picks the preferred provider (`gpt`, the default, or `grok`); when the preferred one is logged out the other serves as fallback. Images are saved under `~/.dsh/plugins/subscriptions/images/` and the paths returned. The `size`/`quality` arguments map onto Grok's `aspect_ratio`/`quality` on the Grok path.
 - **`video_generate`** tool (Grok) — `grok-imagine-video-1.5` via `api.x.ai/v1/videos` (async submit + poll); MP4s are saved under `~/.dsh/plugins/subscriptions/videos/`, the path returned, and the clip plays inline in the conversation. Supports duration (1–15 s), aspect ratio, resolution, and image-to-video via `image_url`.
 
+`image_generate` also supports editing: the model passes optional `referenceImages` (1–5 complete DSH attachment references) to edit or use existing images as sources; omitting it keeps text-to-image generation. References can come from uploads, `read_image`, or previous generated images. Read local files with `read_image` first; paths are not attachment references. Copy references from the image reference text or structured tool results. Their order matches the prompt's image order. Edits save new files and return reusable references, including for subsequent edits with another provider.
+
+Codex edits use `/backend-api/codex/images/edits`; Grok edits use `/v1/images/edits`. Existing provider preference, logged-out fallback, and session tool policy still apply. Empty arrays, duplicate or invalid references, and attachment-limit violations fail explicitly instead of generating a new image. Editing requires the DSH attachment service.
+
+
 ## Install
 
 ### Refreshing model lists

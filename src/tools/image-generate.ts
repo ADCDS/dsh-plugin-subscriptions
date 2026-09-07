@@ -29,10 +29,12 @@ import { proxiedFetch } from '../http.js'
 
 /** Endpoint the codex generation request is posted to. */
 export const IMAGE_GENERATE_URL = 'https://chatgpt.com/backend-api/codex/images/generations'
+export const IMAGE_EDIT_URL = 'https://chatgpt.com/backend-api/codex/images/edits'
 /** The image model the codex subscription endpoint serves. */
 export const IMAGE_GENERATE_MODEL = 'gpt-image-2'
 /** Endpoint the grok generation request is posted to. */
 export const GROK_IMAGE_GENERATE_URL = 'https://api.x.ai/v1/images/generations'
+export const GROK_IMAGE_EDIT_URL = 'https://api.x.ai/v1/images/edits'
 /** The image model the grok subscription endpoint serves. */
 export const GROK_IMAGE_GENERATE_MODEL = 'grok-imagine-image-2.0'
 
@@ -69,6 +71,47 @@ export interface ImageGenerateArgs {
   quality?: 'low' | 'medium' | 'high' | 'auto'
   /** Preferred provider; the other one serves when the preferred is logged out. */
   provider?: 'gpt' | 'grok'
+  /** Ordered durable references; omission generates, presence edits. */
+  referenceImages?: ImageGenerateImageValue[]
+}
+
+/** Resolve references before any upstream request; never silently generate on invalid edits. */
+async function resolveReferenceImages(
+  refs: ImageGenerateImageValue[] | undefined,
+  attachments: AttachmentStore | undefined,
+  signal: AbortSignal,
+): Promise<string[] | undefined> {
+  if (refs === undefined) return undefined
+  if (!Array.isArray(refs) || refs.length < 1 || refs.length > 5) {
+    throw new Error('image_generate: referenceImages must contain 1–5 complete image references; omit only for a new image')
+  }
+  if (attachments === undefined) throw new Error('image_generate: editing requires the DSH attachment service')
+  const seen = new Set<string>()
+  let totalBytes = 0
+  const urls: string[] = []
+  for (const ref of refs) {
+    signal.throwIfAborted()
+    if (ref === null || typeof ref !== 'object'
+      || typeof ref.attachmentId !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(ref.attachmentId)
+      || !['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(ref.mediaType)
+      || ![ref.bytes, ref.width, ref.height].every(value => Number.isSafeInteger(value) && value > 0)) {
+      throw new Error('image_generate: invalid referenceImages entry; copy a complete image reference or call read_image for a local file. Do not omit references to retry an edit.')
+    }
+    if (seen.has(ref.attachmentId)) throw new Error('image_generate: referenceImages contains duplicate images')
+    seen.add(ref.attachmentId)
+    if (refs.length > attachments.imageLimits.maxImagesPerMessage
+      || ref.bytes > attachments.imageLimits.maxImageBytes
+      || totalBytes + ref.bytes > attachments.imageLimits.maxMessageImageBytes) {
+      throw new Error('image_generate: referenceImages exceed DSH image limits')
+    }
+    const stored = await attachments.readImage(imageRefFromValue(ref), signal)
+    totalBytes += stored.data.byteLength
+    if (totalBytes > attachments.imageLimits.maxMessageImageBytes) {
+      throw new Error('image_generate: referenceImages exceed DSH image limits')
+    }
+    urls.push(`data:${stored.ref.mediaType};base64,${Buffer.from(stored.data).toString('base64')}`)
+  }
+  return urls
 }
 
 /**
@@ -226,6 +269,7 @@ interface ImageGenerateImageValue {
   width: number
   height: number
   name?: string
+  originalDimensions?: { width: number; height: number }
 }
 
 /** The canonical output value of one successful generation. */
@@ -244,6 +288,7 @@ function imageRefFromValue(image: ImageGenerateImageValue): ImageAttachmentRef {
     width: image.width,
     height: image.height,
     ...image.name === undefined ? {} : { name: image.name },
+    ...image.originalDimensions === undefined ? {} : { originalDimensions: image.originalDimensions },
   }
 }
 
@@ -258,6 +303,7 @@ function imageGenerateContent(value: ImageGenerateValue): ContentBlock[] {
 /** The text summary of one generation, shared by the model content and the UI card. */
 function imageGenerateText(value: ImageGenerateValue): ContentBlock {
   const text = `Saved ${value.paths.length} image(s):\n${value.paths.map(path => `- ${path}`).join('\n')}`
+    + (value.images?.length ? `\n\nImage references (for image_generate.referenceImages): ${JSON.stringify(value.images)}` : '')
     + (value.revisedPrompt === undefined ? '' : `\n\nRevised prompt: ${value.revisedPrompt}`)
   return { type: 'text', text }
 }
@@ -274,8 +320,36 @@ export function createImageGenerateTool(options: ImageGenerateToolOptions): Tool
       + 'subscription (grok-imagine-image-2.0) and save it as an image file. The `provider` '
       + 'parameter picks the preferred provider (default gpt); when the preferred one is logged '
       + 'out the other serves as fallback. '
-      + 'Returns the saved file paths; on image-capable models the image itself is attached.',
+      + 'Returns the saved file paths; on image-capable models the image itself is attached. '
+      + 'To edit or use existing images as references, pass referenceImages copied from the image reference text '
+      + 'or structured tool results (read_image.image or image_generate.images). Select only the images the user '
+      + 'intends, in prompt order. For local files, call read_image first. Omit referenceImages only for a new image. '
+      + 'If an edit reference fails, fix it and retry; never omit it to substitute text-to-image generation.',
     parameters: {
+      referenceImages: {
+        type: 'array',
+        description: 'Optional 1–5 ordered complete DSH image references to edit or use as source images. Not file paths or URLs. Omit only for new images.',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            attachmentId: { type: 'string', required: true },
+            mediaType: { type: 'string', enum: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'], required: true },
+            bytes: { type: 'integer', required: true },
+            width: { type: 'integer', required: true },
+            height: { type: 'integer', required: true },
+            name: { type: 'string' },
+            originalDimensions: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                width: { type: 'integer', required: true },
+                height: { type: 'integer', required: true },
+              },
+            },
+          },
+        },
+      },
       prompt: { type: 'string', required: true, description: 'What the image should show.' },
       size: {
         type: 'string',
@@ -321,7 +395,7 @@ export function createImageGenerateTool(options: ImageGenerateToolOptions): Tool
     },
     presentCall: args => ({
       card: 'generic',
-      title: `image_generate: ${truncate(args.prompt)}`,
+      title: `image_generate${args.referenceImages === undefined ? '' : ` (edit, ${args.referenceImages.length} images)`}: ${truncate(args.prompt)}`,
     }),
     // The web UI has no image surface on tool cards and flattens result blocks
     // to text/JSON, so the completed card shows the text summary only; the
@@ -332,6 +406,9 @@ export function createImageGenerateTool(options: ImageGenerateToolOptions): Tool
     }),
     async execute(args, exec) {
       const fetchFn = options.fetchFn ?? proxiedFetch
+      // Validate the prompt even when references cannot be resolved.
+      buildImageGenerateBody(args)
+      const references = await resolveReferenceImages(args.referenceImages, options.resolveAttachments?.(), exec.signal)
       // Provider selection: the preferred provider (default gpt) when logged
       // in, the other one as the fallback. A configured-but-logged-out manager
       // still resolves through `session()` below so the standard log-in hint
@@ -347,7 +424,7 @@ export function createImageGenerateTool(options: ImageGenerateToolOptions): Tool
       let response: Response
       if (useCodex && options.codexTokens !== undefined) {
         const session = await options.codexTokens.session()
-        response = await fetchFn(IMAGE_GENERATE_URL, {
+        response = await fetchFn(references === undefined ? IMAGE_GENERATE_URL : IMAGE_EDIT_URL, {
           method: 'POST',
           headers: {
             'authorization': `Bearer ${session.accessToken}`,
@@ -356,19 +433,27 @@ export function createImageGenerateTool(options: ImageGenerateToolOptions): Tool
             'content-type': 'application/json',
             'accept': 'application/json',
           },
-          body: JSON.stringify(buildImageGenerateBody(args)),
+          body: JSON.stringify({
+            ...buildImageGenerateBody(args),
+            ...references === undefined ? {} : { images: references.map(image_url => ({ image_url })) },
+          }),
           signal: exec.signal,
         })
       } else if (useGrok && options.grokTokens !== undefined) {
         const session = await options.grokTokens.session()
-        response = await fetchFn(GROK_IMAGE_GENERATE_URL, {
+        response = await fetchFn(references === undefined ? GROK_IMAGE_GENERATE_URL : GROK_IMAGE_EDIT_URL, {
           method: 'POST',
           headers: {
             'authorization': `Bearer ${session.accessToken}`,
             'content-type': 'application/json',
             'accept': 'application/json',
           },
-          body: JSON.stringify(buildGrokImageGenerateBody(args)),
+          body: JSON.stringify({
+            ...buildGrokImageGenerateBody(args),
+            ...references === undefined ? {} : references.length === 1
+              ? { image: { type: 'image_url', url: references[0] } }
+              : { images: references.map(url => ({ type: 'image_url', url })) },
+          }),
           signal: exec.signal,
         })
       } else {

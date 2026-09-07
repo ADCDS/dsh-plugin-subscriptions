@@ -196,7 +196,9 @@ test('resolveImages: passthrough, loud failure without attachments, and resoluti
     readImage: (ref: unknown) => Promise.resolve({ ref, data: new Uint8Array([104, 105]) }),
   } as never
   const resolved = await resolveImages(withImage, attachments)
-  assert.deepEqual(resolved[0].content, [{ type: 'image', mediaType: 'image/png', dataBase64: 'aGk=' }])
+  assert.deepEqual(resolved[0].content[0], { type: 'image', mediaType: 'image/png', dataBase64: 'aGk=' })
+  assert.match((resolved[0].content[1] as { text: string }).text, /image_generate.referenceImages/)
+  assert.match((resolved[0].content[1] as { text: string }).text, /"attachmentId":"a1"/)
 })
 
 test('tool-result images: resolve attachments and retain parallel results before image follow-up', async () => {

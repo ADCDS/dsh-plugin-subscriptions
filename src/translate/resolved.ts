@@ -88,20 +88,26 @@ export async function resolveImages(
       'UNSUPPORTED',
     )
   }
-  const resolveBlock = async (block: ContentBlock): Promise<TranslatableBlock> => {
+  const resolveBlock = async (block: ContentBlock): Promise<TranslatableBlock[]> => {
     if (block.type === 'tool-result') {
-      return { ...block, content: await Promise.all(block.content.map(resolveBlock)) }
+      return [{ ...block, content: (await Promise.all(block.content.map(resolveBlock))).flat() }]
     }
-    if (block.type !== 'image') return block
+    if (block.type !== 'image') return [block]
     const stored = await attachments.readImage(block.attachment, signal)
-    return {
+    const { attachmentId, mediaType, bytes, width, height, name } = stored.ref
+    return [{
       type: 'image',
       mediaType: stored.ref.mediaType,
       dataBase64: Buffer.from(stored.data).toString('base64'),
-    }
+    }, {
+      type: 'text',
+      text: `Image reference (for image_generate.referenceImages): ${JSON.stringify({
+        attachmentId, mediaType, bytes, width, height, ...name === undefined ? {} : { name },
+      })}`,
+    }]
   }
   return Promise.all(messages.map(async (message): Promise<TranslatableMessage> => ({
     role: message.role,
-    content: await Promise.all(message.content.map(resolveBlock)),
+    content: (await Promise.all(message.content.map(resolveBlock))).flat(),
   })))
 }

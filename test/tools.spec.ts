@@ -21,6 +21,8 @@ import {
   parseXSearchResponse,
 } from '../src/tools/x-search.js'
 import {
+  IMAGE_EDIT_URL,
+  GROK_IMAGE_EDIT_URL,
   buildGrokImageGenerateBody,
   buildImageGenerateBody,
   createImageGenerateTool,
@@ -694,4 +696,79 @@ test('image_generate: nested dispatch defers no context (code mode injects image
   // image-bearing sub-results itself, so the tool must not defer a duplicate.
   assert.equal((value.images ?? []).length, 1)
   assert.equal(deferred.length, 0)
+})
+
+/** Editing uses stored bytes, preserving source order and the canonical output contract. */
+function editFixture() {
+  const ref = { attachmentId: `sha256:${'a'.repeat(64)}`, mediaType: 'image/png' as const, bytes: 3, width: 1, height: 1 }
+  const reads: string[] = []
+  const store = {
+    imageLimits: { maxImagesPerMessage: 5, maxImageBytes: 100, maxMessageImageBytes: 500 },
+    readImage: async (input: typeof ref, signal: AbortSignal) => {
+      signal.throwIfAborted()
+      reads.push(input.attachmentId)
+      if (input.bytes !== 3) throw new Error('metadata mismatch')
+      return { ref: input, data: Buffer.from(input.attachmentId.includes('bbb') ? 'two' : 'one') }
+    },
+    saveImage: async () => ref,
+  }
+  return { ref, reads, store }
+}
+
+for (const provider of ['gpt', 'grok'] as const) {
+  for (const count of [1, 5]) {
+    test(`image editing: ${provider}, ${count} ordered references and reusable output`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'subscriptions-edit-'))
+      try {
+        const { ref, reads, store } = editFixture()
+        const references = Array.from({ length: count }, (_, i) => ({ ...ref, attachmentId: `sha256:${String.fromCharCode(97 + i).repeat(64)}`, originalDimensions: { width: 2, height: 2 } }))
+        const wire = sequenceFetch(Array.from({ length: 2 }, () => new Response(JSON.stringify({ data: [{ b64_json: 'b25l' }] }))))
+        const tool = createImageGenerateTool({ codexTokens: memoryTokens(codexSession), grokTokens: memoryTokens(grokSession),
+          fetchFn: wire.fetchFn, imagesDir: dir, resolveAttachments: () => store as never,
+          resolveLlm: () => fakeLlm(['text', 'image']) as never })
+        const value = await tool.execute({ prompt: 'change background', provider, referenceImages: references }, routedExec('codex', 'm')) as { paths: string[]; images: typeof ref[] }
+        assert.equal(wire.requests[0].url, provider === 'gpt' ? IMAGE_EDIT_URL : GROK_IMAGE_EDIT_URL)
+        const body = wire.requests[0].body as Record<string, unknown>
+        const urls = references.map((_, i) => `data:image/png;base64,${Buffer.from(i === 1 ? 'two' : 'one').toString('base64')}`)
+        if (provider === 'gpt') assert.deepEqual(body.images, urls.map(image_url => ({ image_url })))
+        else if (count === 1) assert.deepEqual(body.image, { type: 'image_url', url: urls[0] })
+        else assert.deepEqual(body.images, urls.map(url => ({ type: 'image_url', url })))
+        assert.equal(body.referenceImages, undefined)
+        assert.deepEqual(reads, references.map(r => r.attachmentId))
+        assert.equal(readFileSync(value.paths[0], 'utf8'), 'one')
+        const rendered = tool.output.render({ prompt: 'change background' }, value as never)
+        assert.match((rendered[0] as { text: string }).text, /Image references/)
+        // Same structured reference is usable immediately inside a nested Code Mode call.
+        await tool.execute({ prompt: 'make it brighter', provider, referenceImages: value.images }, routedExec('codex', 'm', { parent: Symbol('code') }))
+        assert.equal(wire.requests.length, 2)
+      } finally { rmSync(dir, { recursive: true, force: true }) }
+    })
+  }
+}
+
+test('image editing: invalid references, missing store, limits, cancellation never generate', async () => {
+  const { ref, store } = editFixture()
+  let requests = 0
+  const fetchFn = (async () => { requests++; throw new Error('must not fetch') }) as FetchFn
+  const options = { codexTokens: memoryTokens(codexSession), fetchFn, resolveAttachments: () => store as never }
+  const tool = createImageGenerateTool(options)
+  for (const references of [[], Array(6).fill(ref), [ref, ref], [{ ...ref, attachmentId: '/tmp/a.png' }], [{ ...ref, width: 0 }], [{ ...ref, bytes: 4 }]]) {
+    await assert.rejects(() => tool.execute({ prompt: 'edit', referenceImages: references }, fakeExec()))
+  }
+  await assert.rejects(() => createImageGenerateTool({ ...options, resolveAttachments: () => undefined }).execute({ prompt: 'edit', referenceImages: [ref] }, fakeExec()), /attachment service/)
+  store.imageLimits.maxMessageImageBytes = 2
+  await assert.rejects(() => tool.execute({ prompt: 'edit', referenceImages: [ref] }, fakeExec()), /limits/)
+  const exec = { ...fakeExec(), signal: AbortSignal.abort() }
+  await assert.rejects(() => tool.execute({ prompt: 'edit', referenceImages: [ref] }, exec))
+  assert.equal(requests, 0)
+})
+
+test('image editing: provider policy fallback remains editing; upstream errors do not retry', async () => {
+  const { ref, store } = editFixture()
+  const wire = sequenceFetch([new Response('bad edit', { status: 400 })])
+  const tool = createImageGenerateTool({ codexTokens: memoryTokens(codexSession), grokTokens: memoryTokens(grokSession),
+    providerEnabled: p => p === 'grok', fetchFn: wire.fetchFn, resolveAttachments: () => store as never })
+  await assert.rejects(() => tool.execute({ prompt: 'edit', provider: 'gpt', referenceImages: [ref] }, fakeExec()), /400/)
+  assert.equal(wire.requests.length, 1)
+  assert.equal(wire.requests[0].url, GROK_IMAGE_EDIT_URL)
 })
