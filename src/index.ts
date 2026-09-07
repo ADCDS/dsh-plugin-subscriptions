@@ -859,6 +859,7 @@ export function apply(ctx: Context, config: Config): void {
           onWarn,
           resolveAttachments,
           catalogStore: catalogStore('antigravity'),
+          defaultEffortOf: model => defaultEffortOf('antigravity', model),
           pool: () => poolAdapter,
         })
         adapters.set('antigravity', adapter)

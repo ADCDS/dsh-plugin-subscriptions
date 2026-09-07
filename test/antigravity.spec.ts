@@ -399,3 +399,135 @@ test('Antigravity fails over between accounts through the shared pool before emi
   assert.deepEqual(visited, ['Bearer alice', 'Bearer bob'])
   assert.equal(chunks.at(-1)?.type, 'finish')
 })
+
+test('Antigravity uses JSON Schema for Gemini and a detached custom-tool subset for Claude', () => {
+  const input = options([])
+  input.tools = [{ name: 'inspect', description: 'inspect', parameters: {
+    $schema: 'https://json-schema.org/draft/2020-12/schema', type: 'object',
+    $defs: { path: { type: ['string', 'null'], description: 'path', minLength: 1 } },
+    properties: { path: { $ref: '#/$defs/path' }, sandbox_permissions: { type: 'string', enum: ['danger-full-access'] } },
+    required: ['path'], additionalProperties: false,
+  } }]
+  const original = structuredClone(input.tools)
+  const gemini = toAntigravityRequest(input, [], session.projectId).request.tools![0].functionDeclarations[0]
+  assert.equal(gemini.parameters, undefined)
+  const json = gemini.parametersJsonSchema as Record<string, unknown>
+  assert.equal(json.$schema, undefined)
+  assert.equal(json.$defs, undefined)
+  assert.deepEqual((json.properties as Record<string, unknown>).path, { type: ['string', 'null'], description: 'path', minLength: 1 })
+  const claude = toAntigravityRequest({ ...input, model: 'claude-sonnet-4-6' }, [], session.projectId).request.tools![0].functionDeclarations[0]
+  assert.equal(claude.parametersJsonSchema, undefined)
+  const legacy = claude.parameters as Record<string, unknown>
+  assert.deepEqual(legacy.required, ['path'])
+  assert.equal(legacy.additionalProperties, undefined)
+  assert.deepEqual((legacy.properties as Record<string, unknown>).path, { type: 'string', description: 'path' })
+  assert.deepEqual(input.tools, original, 'do not mutate DSH registry schemas')
+})
+
+test('Antigravity rejects unresolved and recursive tool references before provider I/O', () => {
+  for (const parameters of [
+    { type: 'object', properties: { path: { $ref: '#/$defs/missing' } } },
+    { type: 'object', $defs: { node: { $ref: '#/$defs/node' } }, properties: { node: { $ref: '#/$defs/node' } } },
+  ]) {
+    assert.throws(() => toAntigravityRequest({ ...options([]), tools: [{ name: 'test', description: '', parameters }] }, [], session.projectId), /reference/)
+  }
+})
+
+test('Antigravity reasoning uses supported runtime budgets and rejects unsupported effort or token limits', async () => {
+  const { ReasoningEffortId } = await import('@deepseek-ai/dsh-llm')
+  for (const [model, effort, budget] of [
+    ['gemini-3-flash', 'high', -1], ['gemini-3.1-pro-high', 'high', 10001],
+    ['claude-sonnet-4-6', 'high', 1024], ['gpt-oss-120b', 'medium', 8192],
+  ] as const) {
+    const payload = toAntigravityRequest({ ...options([]), model, reasoningEffort: ReasoningEffortId(effort), maxTokens: 20000 }, [], session.projectId)
+    assert.deepEqual(payload.request.generationConfig?.thinkingConfig, { includeThoughts: true, thinkingBudget: budget })
+  }
+  assert.throws(() => toAntigravityRequest({ ...options([]), model: 'claude-sonnet-4-6', reasoningEffort: ReasoningEffortId('high'), maxTokens: 512 }, [], session.projectId), /thinking budget/)
+  assert.throws(() => toAntigravityRequest({ ...options([]), reasoningEffort: ReasoningEffortId('ultra') }, [], session.projectId), /does not support/)
+  const { tokens } = accountTokens()
+  const adapter = new AntigravityAdapter({ tokens, models: [], discovery: false, streamIdleTimeoutMs: 1000, defaultEffortOf: () => 'high' })
+  const info = await adapter.resolveModel('antigravity', 'gemini-3-flash')
+  assert.deepEqual(info.reasoning?.efforts.map(entry => entry.id), ['low', 'medium', 'high'])
+  assert.equal(info.reasoning?.defaultEffort, 'high')
+})
+
+test('Antigravity replays signed text and reasoning only for the same provider and model', () => {
+  const source = {
+    kind: 'model' as const, provider: 'antigravity', model: 'gemini-3-flash',
+    replayState: { response: { kind: 'antigravity', version: 1 }, blocks: [
+      { thoughtSignature: 'reasoning-signature' }, { thoughtSignature: 'text-signature' },
+    ] },
+  }
+  const messages = [message('assistant', [{ type: 'reasoning', text: 'thought' }, { type: 'text', text: 'answer' }], source)]
+  const payload = toAntigravityRequest(options(messages), messages, session.projectId)
+  assert.deepEqual(payload.request.contents[0].parts, [
+    { thought: true, text: 'thought', thoughtSignature: 'reasoning-signature' },
+    { text: 'answer', thoughtSignature: 'text-signature' },
+  ])
+  const changed = toAntigravityRequest({ ...options(messages), model: 'claude-sonnet-4-6' }, messages, session.projectId)
+  assert.deepEqual(changed.request.contents[0].parts, [{ text: 'answer' }])
+})
+
+test('Antigravity falls back from daily to production before streaming on endpoint failure', async () => {
+  const calls: string[] = []
+  const payload = toAntigravityRequest(options([]), [], session.projectId)
+  const response = await requestAntigravityContent(session, payload, true, {}, async (input, init) => {
+    calls.push(String(input))
+    assert.deepEqual(JSON.parse(String(init?.body)), payload)
+    return calls.length === 1 ? new Response('unavailable', { status: 503 }) : new Response('ok')
+  })
+  assert.equal(response.status, 200)
+  assert.deepEqual(calls, [
+    'https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse',
+    'https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse',
+  ])
+})
+
+test('Antigravity does not route around auth, quota, explicit endpoints, or cancellation', async () => {
+  const payload = toAntigravityRequest(options([]), [], session.projectId)
+  for (const status of [400, 401, 403, 429]) {
+    let calls = 0
+    const response = await requestAntigravityContent(session, payload, false, {}, async () => { calls++; return new Response('', { status }) })
+    assert.equal(response.status, status)
+    assert.equal(calls, 1)
+  }
+  let calls = 0
+  await requestAntigravityContent(session, payload, false, runtime, async input => {
+    calls++; assert.ok(String(input).startsWith(runtime.baseURL)); return new Response('', { status: 503 })
+  })
+  assert.equal(calls, 1)
+  const controller = new AbortController()
+  controller.abort()
+  await assert.rejects(requestAntigravityContent(session, payload, true, {}, async () => {
+    assert.fail('cancelled request must not reach any endpoint')
+  }, controller.signal), { name: 'AbortError' })
+})
+
+test('Antigravity catalog discovery shares endpoint fallback', async () => {
+  const calls: string[] = []
+  const models = await fetchAntigravityModels(session, {}, async input => {
+    calls.push(String(input))
+    if (calls.length === 1) throw new TypeError('network failure')
+    return Response.json({ models: { 'gemini-3-flash': { displayName: 'Gemini' } } })
+  })
+  assert.equal(models[0].id, 'gemini-3-flash')
+  assert.equal(calls.length, 2)
+  assert.ok(calls[1].startsWith('https://cloudcode-pa.googleapis.com/'))
+})
+
+test('Antigravity still requires explicit OAuth client configuration', async () => {
+  const { resolveAntigravityOAuthConfig } = await import('../src/providers/antigravity.js')
+  const clientId = process.env.ANTIGRAVITY_CLIENT_ID
+  const clientSecret = process.env.ANTIGRAVITY_CLIENT_SECRET
+  try {
+    delete process.env.ANTIGRAVITY_CLIENT_ID
+    delete process.env.ANTIGRAVITY_CLIENT_SECRET
+    assert.throws(() => resolveAntigravityOAuthConfig(), /OAuth is not configured/)
+    assert.deepEqual(resolveAntigravityOAuthConfig(oauth), oauth)
+  } finally {
+    if (clientId === undefined) delete process.env.ANTIGRAVITY_CLIENT_ID
+    else process.env.ANTIGRAVITY_CLIENT_ID = clientId
+    if (clientSecret === undefined) delete process.env.ANTIGRAVITY_CLIENT_SECRET
+    else process.env.ANTIGRAVITY_CLIENT_SECRET = clientSecret
+  }
+})

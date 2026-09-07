@@ -183,6 +183,10 @@ tools+effort 的自动改道。
 
 Antigravity 不内置 OAuth 客户端凭据。请设置 `ANTIGRAVITY_CLIENT_ID`，并按客户端要求设置 `ANTIGRAVITY_CLIENT_SECRET`；也可使用配置项 `antigravity.clientId` / `antigravity.clientSecret`。可选的 `antigravity.baseURL`、`antigravity.userAgent` 和 `antigravity.onboard` 分别控制 API 地址、客户端标识和账号初始化。此路由使用 Antigravity OAuth 与 v1internal 项目封装，独立于 Gemini CLI。
 
+Antigravity 为 Gemini 使用 `parametersJsonSchema`，为 Claude/GPT-OSS 使用兼容的 `parameters` 子集；本地 schema 引用会先展开，不修改 DSH 工具注册表。无法解析、循环引用及无法表达的自定义工具联合类型会在发送前报错。已识别的模型系列会在模型设置中提供推理等级，并转换为对应的推理预算；文本、推理和工具调用签名仅回放给相同 provider/model。兼容映射参考 [pi-antigravity](https://github.com/Rahularya01/pi-antigravity/tree/697858cafcf1faddf2ae898d2f053b2ff26c05e6)，离线测试不代表账号资格或在线 API 验收通过。
+
+未配置 `antigravity.baseURL` 时，生成请求及目录/项目查询先访问 daily；发生传输错误或 HTTP 404/502/503/504 时，在返回任何流内容前尝试 production。显式配置的地址保持固定。HTTP 400/401/403/429 和已取消请求不触发端点回退；账号初始化不会跨端点重复执行。
+
 ## 模型池
 
 同一订阅下登录了**两个及以上账号**时,选择器显示该 provider **所有账号目录的并集**(按模型 id 去重)。照常在 Claude 组选 `claude-sonnet-5`、在 ChatGPT 组选 `gpt-5.4`——不会多出一个池分组,也不会换 model id。

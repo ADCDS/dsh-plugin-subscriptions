@@ -185,6 +185,10 @@ out of the tools+effort auto-reroute described above.
 
 Antigravity OAuth credentials are not bundled. Set `ANTIGRAVITY_CLIENT_ID` and, when required, `ANTIGRAVITY_CLIENT_SECRET`, or configure `antigravity.clientId` / `antigravity.clientSecret`. Optional `antigravity.baseURL`, `antigravity.userAgent`, and `antigravity.onboard` configure its endpoint, client identity, and account initialization. This route uses Antigravity OAuth and the v1internal project envelope, independently of Gemini CLI.
 
+Antigravity converts Gemini tools to `parametersJsonSchema` and Claude/GPT-OSS tools to the supported `parameters` subset, resolving local schema references without modifying the DSH tool registry. Unresolved/cyclic references and custom-tool unions that cannot be represented fail before the request. Known runtime families expose their reasoning efforts in model settings and use model-specific thinking budgets; signed text, reasoning, and tool calls are replayed only to the same provider/model. Compatibility mapping is based on [pi-antigravity](https://github.com/Rahularya01/pi-antigravity/tree/697858cafcf1faddf2ae898d2f053b2ff26c05e6); offline tests do not verify account eligibility or live API acceptance.
+
+Without `antigravity.baseURL`, generation and catalog/project reads try the daily endpoint, then production on a transport failure or HTTP 404/502/503/504, before returning any stream content. Explicit origins stay pinned. HTTP 400/401/403/429 and cancelled requests do not trigger endpoint fallback; onboarding is never repeated across endpoints.
+
 ## Model pools
 
 When a provider has **two or more logged-in accounts**, the picker shows the **union** of every account's catalog (duplicates dropped). Pick `claude-sonnet-5` under Claude (or `gpt-5.4` under ChatGPT) as usual — there is no extra pool group and no new model id.

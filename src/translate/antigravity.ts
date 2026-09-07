@@ -17,6 +17,8 @@ import type {
 import type { ResolvedToolResultBlock, TranslatableMessage } from './resolved.js'
 import { withToolResultImages } from './resolved.js'
 import { parseSse } from './sse.js'
+import { antigravityThinking } from './antigravity-thinking.js'
+import { antigravityToolParameters } from './antigravity-schema.js'
 
 /** Metadata retained with an assistant block for lossless Antigravity replay. */
 interface AntigravityBlockReplay {
@@ -67,14 +69,16 @@ function toolResultValue(block: ResolvedToolResultBlock): unknown {
 }
 
 /** Safely read per-block replay metadata emitted by this adapter. */
-function replayBlocks(message: TranslatableMessage): readonly AntigravityBlockReplay[] {
+function replayBlocks(message: TranslatableMessage, model?: string): readonly AntigravityBlockReplay[] {
   const source = (message as TranslatableMessage & {
     source?: { kind?: string; replayState?: unknown }
   }).source
+  if (model !== undefined && (message.source?.kind !== 'model'
+    || message.source.provider !== 'antigravity' || message.source.model !== model)) return []
   if (source?.kind !== 'model' || typeof source.replayState !== 'object' || source.replayState === null) return []
   const envelope = source.replayState as { response?: unknown; blocks?: unknown }
   const response = envelope.response as Partial<AntigravityReplayResponse> | undefined
-  if (response?.kind !== 'antigravity' || response.version !== 1 || !Array.isArray(envelope.blocks)) return []
+  if (response === null || response?.kind !== 'antigravity' || response.version !== 1 || !Array.isArray(envelope.blocks)) return []
   return envelope.blocks.map((entry): AntigravityBlockReplay => {
     if (typeof entry !== 'object' || entry === null) return {}
     const signature = (entry as Record<string, unknown>).thoughtSignature
@@ -83,13 +87,14 @@ function replayBlocks(message: TranslatableMessage): readonly AntigravityBlockRe
 }
 
 /** Map harness tool schemas to Gemini function declarations. */
-export function toAntigravityTools(tools: readonly ToolSchema[]): { functionDeclarations: Record<string, unknown>[] }[] {
+export function toAntigravityTools(tools: readonly ToolSchema[], model = 'gemini'): { functionDeclarations: Record<string, unknown>[] }[] {
   if (tools.length === 0) return []
+  const legacy = /^(claude-|gpt-oss-)/.test(model)
   return [{
     functionDeclarations: tools.map(tool => ({
       name: tool.name,
       description: tool.description,
-      parameters: tool.parameters,
+      [legacy ? 'parameters' : 'parametersJsonSchema']: antigravityToolParameters(tool.parameters, legacy),
     })),
   }]
 }
@@ -99,7 +104,7 @@ export function toAntigravityTools(tools: readonly ToolSchema[]): { functionDecl
  * names are recovered from prior tool calls because DSH correlates results by
  * id while the Gemini wire requires both id and name.
  */
-export function toAntigravityContents(messages: readonly TranslatableMessage[]): {
+export function toAntigravityContents(messages: readonly TranslatableMessage[], model?: string): {
   role: 'user' | 'model'
   parts: AntigravityPart[]
 }[] {
@@ -108,15 +113,23 @@ export function toAntigravityContents(messages: readonly TranslatableMessage[]):
   for (const message of withToolResultImages(messages)) {
     if (message.role === 'system') continue
     const role = message.role === 'assistant' ? 'model' as const : 'user' as const
-    const metadata = replayBlocks(message)
+    const metadata = replayBlocks(message, model)
     const parts: AntigravityPart[] = []
     for (let index = 0; index < message.content.length; index++) {
       const block = message.content[index]
       switch (block.type) {
         case 'text':
           // Antigravity's Claude-backed models reject empty text parts.
-          parts.push({ text: block.text.trim().length > 0 ? block.text : '.' })
+          parts.push({
+            text: block.text.trim().length > 0 ? block.text : '.',
+            ...metadata[index]?.thoughtSignature === undefined ? {} : { thoughtSignature: metadata[index].thoughtSignature },
+          })
           break
+        case 'reasoning': {
+          const thoughtSignature = metadata[index]?.thoughtSignature
+          if (thoughtSignature !== undefined) parts.push({ thought: true, text: block.text, thoughtSignature })
+          break
+        }
         case 'image':
           if ('dataBase64' in block) {
             parts.push({ inlineData: { mimeType: block.mediaType, data: block.dataBase64 } })
@@ -169,14 +182,13 @@ export function toAntigravityRequest(
   messages: readonly TranslatableMessage[],
   projectId: string,
 ): AntigravityRequest {
-  const tools = toAntigravityTools(options.tools ?? [])
+  const tools = toAntigravityTools(options.tools ?? [], options.model)
+  const thinkingConfig = antigravityThinking(options.model, options.reasoningEffort, options.maxTokens)
   const generationConfig: Record<string, unknown> = {
     ...options.maxTokens === undefined ? {} : { maxOutputTokens: options.maxTokens },
     ...options.temperature === undefined ? {} : { temperature: options.temperature },
     ...options.stop === undefined || options.stop.length === 0 ? {} : { stopSequences: options.stop },
-    ...options.reasoningEffort === undefined ? {} : {
-      thinkingConfig: { thinkingLevel: String(options.reasoningEffort), includeThoughts: true },
-    },
+    ...thinkingConfig === undefined ? {} : { thinkingConfig },
   }
   const systemTexts = messages.flatMap(message => message.role === 'system'
     ? message.content.filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text').map(block => block.text)
@@ -190,7 +202,7 @@ export function toAntigravityRequest(
     userAgent: 'antigravity',
     requestType: 'agent',
     request: {
-      contents: toAntigravityContents(messages),
+      contents: toAntigravityContents(messages, options.model),
       sessionId,
       ...system === undefined || system.length === 0 ? {} : { systemInstruction: { parts: [{ text: system }] } },
       ...tools.length === 0 ? {} : {

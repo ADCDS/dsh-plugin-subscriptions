@@ -16,6 +16,7 @@ import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
 import type { FlowSpec } from '../auth/oauth-flow.js'
 import type { AntigravitySession, ProviderId } from '../auth/store.js'
 import { resolveImages } from '../translate/resolved.js'
+import { antigravityReasoning } from '../translate/antigravity-thinking.js'
 import {
   parseAntigravityResponse,
   streamAntigravity,
@@ -26,6 +27,7 @@ import {
   httpLlmError,
   idleWatchdog,
   mapFetchFailure,
+  mergeReasoning,
   ModelCatalogCache,
   discoverOrRetryAuth,
   isMissingOrInvalidCredential,
@@ -77,6 +79,7 @@ export interface AntigravityOAuthConfig {
 
 /** Runtime endpoint configuration. */
 export interface AntigravityRuntimeConfig {
+  /** Pin one origin; omitted uses daily with production fallback on endpoint failures. */
   baseURL?: string
   userAgent?: string
   /** Activate an eligible account when loadCodeAssist has no project yet. */
@@ -106,6 +109,32 @@ export function antigravityBaseURL(value?: string): string {
     throw new Error('config.antigravity.baseURL must not contain a path, query, or fragment')
   }
   return parsed.origin
+}
+
+/** Try the production endpoint only when the default endpoint is unavailable. */
+async function fetchAntigravity(
+  method: string,
+  init: RequestInit,
+  runtime: AntigravityRuntimeConfig,
+  fetchFn: FetchFn,
+): Promise<Response> {
+  // Explicit origins stay pinned, and onboarding is not repeated across endpoints.
+  const endpoints = runtime.baseURL?.trim() || method === 'onboardUser'
+    ? [antigravityBaseURL(runtime.baseURL)]
+    : [ANTIGRAVITY_DEFAULT_BASE_URL, ANTIGRAVITY_PROD_BASE_URL]
+  for (const [index, endpoint] of endpoints.entries()) {
+    init.signal?.throwIfAborted()
+    let response: Response
+    try {
+      response = await fetchFn(`${endpoint}/v1internal:${method}`, init)
+    } catch (error) {
+      if (init.signal?.aborted || index === endpoints.length - 1) throw error
+      continue
+    }
+    if (index === endpoints.length - 1 || ![404, 502, 503, 504].includes(response.status)) return response
+    await response.body?.cancel()
+  }
+  throw new Error('Antigravity endpoint list is empty')
 }
 
 /** Google authorization-code + PKCE flow for Antigravity. */
@@ -163,12 +192,12 @@ async function callInternal<T>(
   fetchFn: FetchFn,
   signal?: AbortSignal,
 ): Promise<T> {
-  const response = await fetchFn(`${antigravityBaseURL(runtime.baseURL)}/v1internal:${method}`, {
+  const response = await fetchAntigravity(method, {
     method: 'POST',
     headers: antigravityHeaders(accessToken, runtime.userAgent),
     body: JSON.stringify(body),
     ...signal === undefined ? {} : { signal },
-  })
+  }, runtime, fetchFn)
   if (!response.ok) throw await httpLlmError(response, `Antigravity ${method}`)
   return response.json() as Promise<T>
 }
@@ -432,7 +461,7 @@ export async function requestAntigravityContent(
   fetchFn: FetchFn = proxiedFetch,
   signal?: AbortSignal,
 ): Promise<Response> {
-  return fetchFn(antigravityGenerateURL(runtime.baseURL, stream), {
+  return fetchAntigravity(stream ? 'streamGenerateContent?alt=sse' : 'generateContent', {
     method: 'POST',
     headers: {
       ...antigravityHeaders(session.accessToken, runtime.userAgent),
@@ -440,7 +469,7 @@ export async function requestAntigravityContent(
     },
     body: JSON.stringify(payload),
     ...signal === undefined ? {} : { signal },
-  })
+  }, runtime, fetchFn)
 }
 
 export interface AntigravityAdapterOptions {
@@ -455,6 +484,7 @@ export interface AntigravityAdapterOptions {
   fetchFn?: FetchFn
   resolveAttachments?: () => AttachmentStore | undefined
   catalogStore?: CatalogPersistence
+  defaultEffortOf?: (model: string) => string | undefined
 }
 
 /** DSH provider adapter for the `antigravity` route. */
@@ -588,6 +618,7 @@ export class AntigravityAdapter extends LlmAdapter {
   async resolveOwnModel(provider: string, model: string, account?: string): Promise<LlmResolvedModelInfo> {
     const discovered = await this.discovered(model, account)
     const configured = this.options.models.find(entry => entry.id === model)
+    const reasoning = mergeReasoning(this.options.defaultEffortOf?.(model), antigravityReasoning(model))
     return {
       provider,
       id: model,
@@ -596,6 +627,7 @@ export class AntigravityAdapter extends LlmAdapter {
       inputModalities: discovered?.inputModalities ?? configured?.inputModalities ?? ['text', 'image'],
       context: { contextWindow: discovered?.contextWindow ?? configured?.contextWindow ?? ANTIGRAVITY_CONTEXT_WINDOW },
       defaultMaxTokens: configured?.maxTokens ?? ANTIGRAVITY_DEFAULT_MAX_TOKENS,
+      ...reasoning === undefined ? {} : { reasoning },
     }
   }
 
