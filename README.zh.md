@@ -181,7 +181,7 @@ Codex 模型还可填写上下文 token 数，留空跟随服务商。插件读�
 responses-only 系列（gpt-5.5/5.6 等）会拒绝该端点。固定为 `chat-completions` 也会退出上文所述
 tools+effort 的自动改道。
 
-Antigravity 不内置 OAuth 客户端凭据。请设置 `ANTIGRAVITY_CLIENT_ID`，并按客户端要求设置 `ANTIGRAVITY_CLIENT_SECRET`；也可使用配置项 `antigravity.clientId` / `antigravity.clientSecret`。可选的 `antigravity.baseURL`、`antigravity.userAgent` 和 `antigravity.onboard` 分别控制 API 地址、客户端标识和账号初始化。此路由使用 Antigravity OAuth 与 v1internal 项目封装，独立于 Gemini CLI。
+Antigravity 已内置 [pi-antigravity 使用的公开桌面 OAuth 客户端配置](https://github.com/Rahularya01/pi-antigravity/blob/697858cafcf1faddf2ae898d2f053b2ff26c05e6/SECURITY.md#oauth-client-credentials)，无需额外配置客户端即可点击「登录」进入 Google 授权。使用自定义客户端时，可配置 `antigravity.clientId` 及其可选的 `antigravity.clientSecret`，或设置 `ANTIGRAVITY_CLIENT_ID` 及其可选的 `ANTIGRAVITY_CLIENT_SECRET`。优先级为插件配置、环境变量、内置默认值；ID 和 secret 按同一来源成对读取，自定义 ID 不会继承默认 secret，单独提供 secret 会报错。可选的 `antigravity.baseURL`、`antigravity.userAgent` 和 `antigravity.onboard` 分别控制 API 地址、客户端标识和账号初始化。此路由使用 Antigravity OAuth 与 v1internal 项目封装，独立于 Gemini CLI。
 
 Antigravity 为 Gemini 使用 `parametersJsonSchema`，为 Claude/GPT-OSS 使用兼容的 `parameters` 子集；本地 schema 引用会先展开，不修改 DSH 工具注册表。无法解析、循环引用及无法表达的自定义工具联合类型会在发送前报错。已识别的模型系列会在模型设置中提供推理等级，并转换为对应的推理预算；文本、推理和工具调用签名仅回放给相同 provider/model。兼容映射参考 [pi-antigravity](https://github.com/Rahularya01/pi-antigravity/tree/697858cafcf1faddf2ae898d2f053b2ff26c05e6)，离线测试不代表账号资格或在线 API 验收通过。
 

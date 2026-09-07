@@ -45,6 +45,7 @@ import type {
   UsageWindow,
 } from './common.js'
 import { proxiedFetch } from '../http.js'
+import { ANTIGRAVITY_DEFAULT_CLIENT_ID, ANTIGRAVITY_DEFAULT_CLIENT_SECRET } from './antigravity-oauth-client.js'
 import { AccountTokenManager, DISCOVERY_TIMEOUT_MS, unionAccountCatalogs } from './accounts.js'
 import type { PoolAdapter } from './pool.js'
 import { DEFAULT_RATE_LIMIT_WAIT, DEFAULT_RETRY, subscriptionRetryPolicy } from './rate-limit.js'
@@ -71,7 +72,7 @@ export const ANTIGRAVITY_SCOPES = [
   'https://www.googleapis.com/auth/experimentsandconfigs',
 ] as const
 
-/** OAuth client configuration. Values must come from config/environment. */
+/** OAuth client configuration; explicit clients override the bundled desktop identity. */
 export interface AntigravityOAuthConfig {
   clientId: string
   clientSecret?: string
@@ -86,17 +87,22 @@ export interface AntigravityRuntimeConfig {
   onboard?: boolean
 }
 
-/** Resolve and validate a user-supplied OAuth config without embedded credentials. */
+/** Resolve a client pair: plugin config, environment, then the public desktop default. */
 export function resolveAntigravityOAuthConfig(config?: Partial<AntigravityOAuthConfig>): AntigravityOAuthConfig {
-  const clientId = config?.clientId?.trim() || process.env.ANTIGRAVITY_CLIENT_ID?.trim() || ''
-  const clientSecret = config?.clientSecret?.trim() || process.env.ANTIGRAVITY_CLIENT_SECRET?.trim()
-  if (clientId.length === 0) {
-    throw new Error(
-      'Antigravity OAuth is not configured; set config.antigravity.clientId or ANTIGRAVITY_CLIENT_ID '
-      + '(and clientSecret/ANTIGRAVITY_CLIENT_SECRET when required by the Google OAuth client)',
-    )
+  const configuredId = config?.clientId?.trim()
+  const configuredSecret = config?.clientSecret?.trim()
+  const environmentId = process.env.ANTIGRAVITY_CLIENT_ID?.trim()
+  const environmentSecret = process.env.ANTIGRAVITY_CLIENT_SECRET?.trim()
+  if (configuredId) {
+    // A custom PKCE-only client must never inherit a different client's secret.
+    return { clientId: configuredId, ...configuredSecret ? { clientSecret: configuredSecret } : {} }
   }
-  return { clientId, ...clientSecret === undefined || clientSecret.length === 0 ? {} : { clientSecret } }
+  if (configuredSecret) throw new Error('config.antigravity.clientSecret requires config.antigravity.clientId')
+  if (environmentId) {
+    return { clientId: environmentId, ...environmentSecret ? { clientSecret: environmentSecret } : {} }
+  }
+  if (environmentSecret) throw new Error('ANTIGRAVITY_CLIENT_SECRET requires ANTIGRAVITY_CLIENT_ID')
+  return { clientId: ANTIGRAVITY_DEFAULT_CLIENT_ID, clientSecret: ANTIGRAVITY_DEFAULT_CLIENT_SECRET }
 }
 
 /** Normalize the configured API origin and reject paths/credentials. */

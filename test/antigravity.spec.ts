@@ -515,15 +515,30 @@ test('Antigravity catalog discovery shares endpoint fallback', async () => {
   assert.ok(calls[1].startsWith('https://cloudcode-pa.googleapis.com/'))
 })
 
-test('Antigravity still requires explicit OAuth client configuration', async () => {
+test('Antigravity OAuth selects defaults or one complete override source without mixing secrets', async () => {
   const { resolveAntigravityOAuthConfig } = await import('../src/providers/antigravity.js')
   const clientId = process.env.ANTIGRAVITY_CLIENT_ID
   const clientSecret = process.env.ANTIGRAVITY_CLIENT_SECRET
   try {
     delete process.env.ANTIGRAVITY_CLIENT_ID
     delete process.env.ANTIGRAVITY_CLIENT_SECRET
-    assert.throws(() => resolveAntigravityOAuthConfig(), /OAuth is not configured/)
+    const defaults = resolveAntigravityOAuthConfig()
+    assert.match(defaults.clientId, /\.apps\.googleusercontent\.com$/)
+    assert.ok(defaults.clientSecret && defaults.clientSecret.length > 10)
+    assert.deepEqual(resolveAntigravityOAuthConfig({ clientId: '  ', clientSecret: ' ' }), defaults)
     assert.deepEqual(resolveAntigravityOAuthConfig(oauth), oauth)
+    assert.deepEqual(resolveAntigravityOAuthConfig({ clientId: 'pkce-client' }), { clientId: 'pkce-client' })
+    process.env.ANTIGRAVITY_CLIENT_ID = ' env-client '
+    process.env.ANTIGRAVITY_CLIENT_SECRET = ' env-secret '
+    assert.deepEqual(resolveAntigravityOAuthConfig(), { clientId: 'env-client', clientSecret: 'env-secret' })
+    assert.deepEqual(resolveAntigravityOAuthConfig(oauth), oauth)
+    assert.deepEqual(resolveAntigravityOAuthConfig({ clientId: 'pkce-client' }), { clientId: 'pkce-client' })
+    delete process.env.ANTIGRAVITY_CLIENT_SECRET
+    assert.deepEqual(resolveAntigravityOAuthConfig(), { clientId: 'env-client' })
+    assert.throws(() => resolveAntigravityOAuthConfig({ clientSecret: 'unpaired' }), /requires config.antigravity.clientId/)
+    delete process.env.ANTIGRAVITY_CLIENT_ID
+    process.env.ANTIGRAVITY_CLIENT_SECRET = 'unpaired'
+    assert.throws(() => resolveAntigravityOAuthConfig(), /requires ANTIGRAVITY_CLIENT_ID/)
   } finally {
     if (clientId === undefined) delete process.env.ANTIGRAVITY_CLIENT_ID
     else process.env.ANTIGRAVITY_CLIENT_ID = clientId
