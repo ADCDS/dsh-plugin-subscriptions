@@ -22,8 +22,10 @@ import type { ContentBlock, LlmRuntime } from '@deepseek-ai/dsh-llm'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition, ToolExecution } from '@deepseek-ai/dsh-tools'
 import type { CodexSession, GrokSession } from '../auth/store.js'
-import { httpLlmError } from '../providers/common.js'
 import { AccountTokenManager } from '../providers/accounts.js'
+import { ImageAccountPool } from '../providers/image-pool.js'
+import { codexRateLimitReset } from '../providers/codex.js'
+import { grokRateLimitReset } from '../providers/grok.js'
 import type { FetchFn } from '../providers/common.js'
 import { proxiedFetch } from '../http.js'
 
@@ -40,6 +42,8 @@ export const GROK_IMAGE_GENERATE_MODEL = 'grok-imagine-image-2.0'
 
 /** Dependencies of the `image_generate` tool. */
 export interface ImageGenerateToolOptions {
+  /** Shared generation/edit account scheduling; standalone tools get a private pool. */
+  imagePool?: ImageAccountPool
   /** Creation-time provider policy; existing sessions retain their original tools. */
   providerEnabled?: (provider: 'codex' | 'grok', createdAt: number | undefined) => boolean
   /** Codex session source; the default preferred provider (`provider: 'gpt'`). */
@@ -314,12 +318,15 @@ function imageGenerateText(value: ImageGenerateValue): ContentBlock {
  * @returns the tool to register on `ctx.tools`.
  */
 export function createImageGenerateTool(options: ImageGenerateToolOptions): ToolDefinition {
+  const imagePool = options.imagePool ?? new ImageAccountPool()
   return defineTool({
     name: 'image_generate',
     description: 'Generate an image with the ChatGPT subscription (gpt-image-2) or the Grok '
       + 'subscription (grok-imagine-image-2.0) and save it as an image file. The `provider` '
       + 'parameter picks the preferred provider (default gpt); when the preferred one is logged '
       + 'out the other serves as fallback. '
+      + 'Within the selected provider, image requests use available subscription accounts; '
+      + 'quota or authentication rejection can switch accounts without changing providers. '
       + 'Returns the saved file paths; on image-capable models the image itself is attached. '
       + 'To edit or use existing images as references, pass referenceImages copied from the image reference text '
       + 'or structured tool results (read_image.image or image_generate.images). Select only the images the user '
@@ -417,44 +424,50 @@ export function createImageGenerateTool(options: ImageGenerateToolOptions): Tool
       const createdAt = exec.agent?.session.header?.createdAt
       const codexEnabled = options.providerEnabled?.('codex', createdAt) !== false
       const grokEnabled = options.providerEnabled?.('grok', createdAt) !== false
-      const codexReady = codexEnabled && options.codexTokens !== undefined && await options.codexTokens.hasSession()
-      const grokReady = grokEnabled && options.grokTokens !== undefined && await options.grokTokens.hasSession()
+      const codexReady = codexEnabled && options.codexTokens !== undefined && (await options.codexTokens.list()).length > 0
+      const grokReady = grokEnabled && options.grokTokens !== undefined && (await options.grokTokens.list()).length > 0
       const useGrok = preferGrok ? grokReady : grokReady && !codexReady
       const useCodex = !useGrok && codexReady
       let response: Response
       if (useCodex && options.codexTokens !== undefined) {
-        const session = await options.codexTokens.session()
-        response = await fetchFn(references === undefined ? IMAGE_GENERATE_URL : IMAGE_EDIT_URL, {
-          method: 'POST',
-          headers: {
-            'authorization': `Bearer ${session.accessToken}`,
-            'chatgpt-account-id': session.accountId,
-            'originator': 'codex_cli_rs',
-            'content-type': 'application/json',
-            'accept': 'application/json',
-          },
-          body: JSON.stringify({
-            ...buildImageGenerateBody(args),
-            ...references === undefined ? {} : { images: references.map(image_url => ({ image_url })) },
+        response = await imagePool.request({
+          provider: 'codex', tokens: options.codexTokens, signal: exec.signal,
+          owner: exec.agent?.session, rateLimitReset: codexRateLimitReset,
+          send: session => fetchFn(references === undefined ? IMAGE_GENERATE_URL : IMAGE_EDIT_URL, {
+            method: 'POST',
+            headers: {
+              'authorization': `Bearer ${session.accessToken}`,
+              'chatgpt-account-id': session.accountId,
+              'originator': 'codex_cli_rs',
+              'content-type': 'application/json',
+              'accept': 'application/json',
+            },
+            body: JSON.stringify({
+              ...buildImageGenerateBody(args),
+              ...references === undefined ? {} : { images: references.map(image_url => ({ image_url })) },
           }),
           signal: exec.signal,
+          }),
         })
       } else if (useGrok && options.grokTokens !== undefined) {
-        const session = await options.grokTokens.session()
-        response = await fetchFn(references === undefined ? GROK_IMAGE_GENERATE_URL : GROK_IMAGE_EDIT_URL, {
-          method: 'POST',
-          headers: {
-            'authorization': `Bearer ${session.accessToken}`,
-            'content-type': 'application/json',
-            'accept': 'application/json',
-          },
-          body: JSON.stringify({
-            ...buildGrokImageGenerateBody(args),
-            ...references === undefined ? {} : references.length === 1
-              ? { image: { type: 'image_url', url: references[0] } }
-              : { images: references.map(url => ({ type: 'image_url', url })) },
+        response = await imagePool.request({
+          provider: 'grok', tokens: options.grokTokens, signal: exec.signal,
+          owner: exec.agent?.session, rateLimitReset: grokRateLimitReset,
+          send: session => fetchFn(references === undefined ? GROK_IMAGE_GENERATE_URL : GROK_IMAGE_EDIT_URL, {
+            method: 'POST',
+            headers: {
+              'authorization': `Bearer ${session.accessToken}`,
+              'content-type': 'application/json',
+              'accept': 'application/json',
+            },
+            body: JSON.stringify({
+              ...buildGrokImageGenerateBody(args),
+              ...references === undefined ? {} : references.length === 1
+                ? { image: { type: 'image_url', url: references[0] } }
+                : { images: references.map(url => ({ type: 'image_url', url })) },
           }),
           signal: exec.signal,
+          }),
         })
       } else {
         if (!codexEnabled && !grokEnabled) throw new Error('image_generate: disabled for this session')
@@ -465,7 +478,6 @@ export function createImageGenerateTool(options: ImageGenerateToolOptions): Tool
         await manager.session() // logged out: throws the provider's log-in hint
         throw new Error('image_generate: no image provider is logged in')
       }
-      if (!response.ok) throw await httpLlmError(response, 'image_generate')
       const images = parseImageGenerateResponse(await response.json())
       const directory = options.imagesDir ?? imagesDirectory()
       await mkdir(directory, { recursive: true })

@@ -66,6 +66,8 @@ Also included, registered when the matching provider is enabled:
 Codex edits use `/backend-api/codex/images/edits`; Grok edits use `/v1/images/edits`. Existing provider preference, logged-out fallback, and session tool policy still apply. Empty arrays, duplicate or invalid references, and attachment-limit violations fail explicitly instead of generating a new image. Editing requires the DSH attachment service.
 
 
+Image generation and editing share same-provider account scheduling: try the default account first, then prefer the successful account in that session. Explicit quota, authentication, or image-entitlement rejection tries the remaining accounts; a 401 gets at most one credential refresh and retry first. Image-only cooldowns honor provider reset times and clear on login/logout. Transport failures, timeouts, 5xx responses, and invalid requests do not automatically resend, avoiding duplicate images. Set `pool.enabled: false` or `pool.autoAccounts: false` (legacy `autoFamilies` is accepted) to use only the default account. Image scheduling does not use chat catalogs, chat quota scoring, `families`, or `tiers`.
+
 ## Install
 
 ### Refreshing model lists

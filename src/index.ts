@@ -67,6 +67,7 @@ import type { RateLimitConfig } from './providers/rate-limit.js'
 import { catalogStore } from './providers/catalog-store.js'
 import { CodexClientVersionCache } from './providers/codex-client-version.js'
 import { PoolAdapter } from './providers/pool.js'
+import { ImageAccountPool } from './providers/image-pool.js'
 import { buildAccountPools, poolKey } from './providers/pool-family.js'
 import type { PoolDefinition, PoolMemberRef } from './providers/pool-family.js'
 import { PoolHealthRegistry } from './providers/pool-health.js'
@@ -597,7 +598,12 @@ export function apply(ctx: Context, config: Config): void {
   let poolHealth: PoolHealthRegistry | undefined
   let poolUsage: PoolUsageTracker | undefined
   let poolAdapter: PoolAdapter | undefined
+  const imagePool = new ImageAccountPool({
+    enabled: config.pool?.enabled !== false && (config.pool?.autoAccounts ?? config.pool?.autoFamilies ?? true),
+    onWarn,
+  })
   const authChanged = (provider: ProviderId, account?: string): void => {
+    if (provider === 'codex' || provider === 'grok') imagePool.clear(provider, account)
     // Login, logout, and credential death all pass through here; a copilot
     // auth transition also drops the adapter's captured reasoning replay
     // state (isolation is already account-scoped — this is memory hygiene).
@@ -1056,6 +1062,7 @@ export function apply(ctx: Context, config: Config): void {
     }
     if (codexTokens !== undefined || grokTokens !== undefined) {
       toolsCtx.tools.register(createImageGenerateTool({
+        imagePool,
         ...codexTokens === undefined ? {} : { codexTokens },
         ...grokTokens === undefined ? {} : { grokTokens },
         resolveAttachments,
