@@ -4,7 +4,8 @@
  * pill. Collapsed, it shows the rate-limit windows of the provider behind the
  * session's CURRENT model (a GPT model → Codex usage, a Claude model → Claude
  * usage); clicking it opens a trigger-anchored dialog listing every logged-in
- * provider's default account and all of its windows, the current one first.
+ * account of every provider with all of its windows, the current provider
+ * first and the default account (starred) first within a provider.
  *
  * Usage rides the `subscriptions-auth` `status` + `usage` endpoints on a slow
  * poll (the server shares its cache across UI surfaces); the current model
@@ -12,8 +13,9 @@
  * poll, since the host pushes nothing on a model switch. Renders nothing when
  * no provider has a logged-in account that reports usage.
  *
- * Only the default account is shown — the same account direct (non-pool)
- * routes serve; the full per-account breakdown lives in Settings → 订阅.
+ * The collapsed pill reads only the default account — the same account
+ * direct (non-pool) routes serve — so it stays one short segment even for a
+ * provider with several accounts connected; the dialog shows them all.
  * Every color resolves through a `--dsw-*` design token and every
  * user-visible string goes through the locale `t` of the
  * 'settings.subscriptions' namespace.
@@ -55,14 +57,29 @@ export type SubscriptionUsageBadgeProps = PropsRuntime<'conversation.composer.do
   & Partial<SubscriptionUsageBadgeInjected>
   & Partial<PropsLocale<'settings.subscriptions'>>
 
-/** One provider's usage snapshot as rendered by the badge (default account only). */
+/** One logged-in account's usage windows, as listed in the expanded dialog. */
+export interface AccountUsageDisplay {
+  /** Account key (the `usage` endpoint's `account` argument). */
+  key: string
+  /** Display handle (email / login), when the provider reports one. */
+  account?: string
+  plan?: string
+  /** The account direct routes serve; the collapsed pill reads this one. */
+  isDefault: boolean
+  windows: UsageWindow[]
+}
+
+/** One provider's usage snapshot: every logged-in account that reports windows. */
 export interface ProviderUsageDisplay {
   provider: SubscriptionProvider
   name: string
-  /** Default account's display handle (email / login), when the provider reports one. */
-  account?: string
-  plan?: string
-  windows: UsageWindow[]
+  /** Default account first, then the rest in the `status` endpoint's order. */
+  accounts: AccountUsageDisplay[]
+}
+
+/** The account the collapsed pill reads: the default one, else the first listed. */
+export function pillAccountOf(d: ProviderUsageDisplay): AccountUsageDisplay {
+  return d.accounts.find(a => a.isDefault) ?? d.accounts[0]!
 }
 
 /** Brand display names (short form for the compact badge). */
@@ -120,9 +137,9 @@ function usedPercent(w: UsageWindow): number {
   return Math.round(Math.min(100, Math.max(0, w.usedPercent)))
 }
 
-/** Compact one-line readout of a provider: `Codex 6d1h 25% · 1h58m 13%`. */
+/** Compact one-line readout of a provider's pill account: `Codex 6d1h 25% · 1h58m 13%`. */
 export function compactSegment(d: ProviderUsageDisplay): string {
-  const parts = d.windows.map(w => `${windowLabel(w)} ${usedPercent(w)}%`)
+  const parts = pillAccountOf(d).windows.map(w => `${windowLabel(w)} ${usedPercent(w)}%`)
   return `${d.name} ${parts.join(' · ')}`
 }
 
@@ -148,10 +165,17 @@ export function expandedDisplays(
   return match === undefined ? displays : [match, ...displays.filter(d => d !== match)]
 }
 
-/** The default account of a provider's account list, when any is logged in. */
-function defaultAccountOf(status: ProviderStatus | undefined): AccountStatus | undefined {
-  if (status === undefined || status.accounts.length === 0) return undefined
-  return status.accounts.find(a => a.isDefault) ?? status.accounts[0]
+/**
+ * A provider's logged-in accounts, the effective default first. When no
+ * account is flagged default the first listed stands in, matching what
+ * direct routes fall back to.
+ */
+function accountsOf(status: ProviderStatus | undefined): AccountStatus[] {
+  if (status === undefined || status.accounts.length === 0) return []
+  const fallback = status.accounts.find(a => a.isDefault) ?? status.accounts[0]!
+  return status.accounts
+    .map(a => (a === fallback ? { ...a, isDefault: true } : a))
+    .sort((a, b) => Number(b.isDefault) - Number(a.isDefault))
 }
 
 /** English-dictionary fallback for a missing inject `t` (standalone renders). */
@@ -172,7 +196,7 @@ function usageWindowLabel(t: Translate, window: UsageWindow): string {
 /**
  * The composer subscription-usage badge: a pill reading e.g.
  * `Codex 6d1h 25%` for the current model's provider, opening a dialog with
- * every provider's default-account windows. Returns null when no data is
+ * every provider's accounts and their windows. Returns null when no data is
  * available.
  */
 export function SubscriptionUsageBadge({ rpc, currentProvider, t }: SubscriptionUsageBadgeProps) {
@@ -192,12 +216,12 @@ export function SubscriptionUsageBadge({ rpc, currentProvider, t }: Subscription
   // re-render; the model poll mounts once and reads through this ref.
   const currentRef = useRef(currentProvider)
   currentRef.current = currentProvider
-  // Last-known-good display per provider, kept across a failed poll (e.g. a
-  // 429 during the server's own negative-cache cooldown) so the segment
-  // doesn't flicker away — it only disappears once the default account
-  // actually logs out or a fetch succeeds but reports the window as
+  // Last-known-good windows per account (keyed `provider:accountKey`), kept
+  // across a failed poll (e.g. a 429 during the server's own negative-cache
+  // cooldown) so a row doesn't flicker away — it only disappears once the
+  // account actually logs out or a fetch succeeds but reports the window as
   // unsupported.
-  const lastKnownRef = useRef(new Map<SubscriptionProvider, ProviderUsageDisplay>())
+  const lastKnownRef = useRef(new Map<string, UsageWindow[]>())
 
   const refresh = useCallback(async (): Promise<void> => {
     if (rpc === undefined || inflightRef.current) return
@@ -208,52 +232,67 @@ export function SubscriptionUsageBadge({ rpc, currentProvider, t }: Subscription
       }>(rpc, 'status', {})
       if (!mountedRef.current) return
 
-      const accounts = new Map<SubscriptionProvider, AccountStatus>()
-      for (const id of Object.keys(statusResp.providers) as SubscriptionProvider[]) {
-        const account = defaultAccountOf(statusResp.providers[id])
-        if (account !== undefined) accounts.set(id, account)
+      // Every logged-in account of every provider, in a stable order (the
+      // `status` provider order, default account first) so rows don't jump
+      // around as polls settle at different times.
+      const roster: { provider: SubscriptionProvider; account: AccountStatus }[] = []
+      for (const provider of Object.keys(statusResp.providers) as SubscriptionProvider[]) {
+        for (const account of accountsOf(statusResp.providers[provider])) roster.push({ provider, account })
       }
+      const keyOf = (provider: SubscriptionProvider, account: AccountStatus): string => `${provider}:${account.key}`
 
       const lastKnown = lastKnownRef.current
       // Drop last-known state for anything no longer logged in — that is a
       // real signal, unlike a fetch failure.
-      for (const provider of lastKnown.keys()) {
-        if (!accounts.has(provider)) lastKnown.delete(provider)
+      const live = new Set(roster.map(({ provider, account }) => keyOf(provider, account)))
+      for (const key of lastKnown.keys()) {
+        if (!live.has(key)) lastKnown.delete(key)
       }
 
-      if (accounts.size === 0) {
+      if (roster.length === 0) {
         setDisplays([])
         return
       }
 
       const results = await Promise.allSettled(
-        [...accounts.entries()].map(async ([provider, account]) => {
+        roster.map(async ({ provider, account }) => {
           const usage = await callSubscriptionsAuth<ProviderUsage>(rpc, 'usage', { provider, account: account.key })
           return { provider, account, usage }
         }),
       )
       if (!mountedRef.current) return
 
+      const plans = new Map<string, string>()
       for (const r of results) {
-        if (r.status !== 'fulfilled') continue // keep whatever is cached for this provider
+        if (r.status !== 'fulfilled') continue // keep whatever is cached for this account
         const { provider, account, usage } = r.value
+        const key = keyOf(provider, account)
+        if (usage.plan !== undefined) plans.set(key, usage.plan)
         if (!usage.supported || !usage.windows || usage.windows.length === 0) {
-          lastKnown.delete(provider)
+          lastKnown.delete(key)
           continue
         }
-        lastKnown.set(provider, {
-          provider,
-          name: PROVIDER_NAMES[provider],
-          ...account.account === undefined ? {} : { account: account.account },
-          ...(usage.plan ?? account.plan) === undefined ? {} : { plan: usage.plan ?? account.plan },
-          windows: usage.windows,
-        })
+        lastKnown.set(key, usage.windows)
       }
-      // Render in a stable order (the account map's insertion order, which
-      // follows Object.keys(statusResp.providers)) so a segment doesn't jump
-      // around as polls settle at different times.
-      const order = [...accounts.keys()]
-      setDisplays(order.map(provider => lastKnown.get(provider)).filter((d): d is ProviderUsageDisplay => d !== undefined))
+
+      const byProvider = new Map<SubscriptionProvider, ProviderUsageDisplay>()
+      for (const { provider, account } of roster) {
+        const key = keyOf(provider, account)
+        const windows = lastKnown.get(key)
+        if (windows === undefined) continue
+        const plan = plans.get(key) ?? account.plan
+        const row: AccountUsageDisplay = {
+          key: account.key,
+          isDefault: account.isDefault,
+          ...account.account === undefined ? {} : { account: account.account },
+          ...plan === undefined ? {} : { plan },
+          windows,
+        }
+        const display = byProvider.get(provider)
+        if (display === undefined) byProvider.set(provider, { provider, name: PROVIDER_NAMES[provider], accounts: [row] })
+        else display.accounts.push(row)
+      }
+      setDisplays([...byProvider.values()])
     } catch {
       // A failed poll must not crash the badge; keep last known state.
     } finally {
@@ -375,17 +414,22 @@ export function SubscriptionUsageBadge({ rpc, currentProvider, t }: Subscription
                   {d.name}
                   {d.provider === current && <span style={styles.currentTag}>{translate('usageBadgeCurrent')}</span>}
                 </span>
-                <span style={styles.providerMeta}>
-                  {[d.account, d.plan === undefined ? undefined : translate('usagePlan', { plan: d.plan })]
-                    .filter((part): part is string => part !== undefined && part !== '')
-                    .join(' · ')}
-                </span>
+                {d.accounts.length === 1 && <AccountMeta account={d.accounts[0]!} translate={translate} />}
               </div>
-              <dl style={styles.details}>
-                {d.windows.map((w, i) => (
-                  <WindowRow key={i} label={usageWindowLabel(translate, w)} window={w} />
-                ))}
-              </dl>
+              {d.accounts.map((account, accountIndex) => (
+                <div key={account.key} style={accountIndex === 0 ? undefined : styles.accountBlock}>
+                  {d.accounts.length > 1 && (
+                    <div style={styles.accountRow}>
+                      <AccountMeta account={account} translate={translate} />
+                    </div>
+                  )}
+                  <dl style={styles.details}>
+                    {account.windows.map((w, i) => (
+                      <WindowRow key={i} label={usageWindowLabel(translate, w)} window={w} />
+                    ))}
+                  </dl>
+                </div>
+              ))}
             </section>
           ))}
         </div>,
@@ -414,6 +458,22 @@ function statsScopeOf(seat: HTMLElement): HTMLElement | null {
     node = node.parentElement
   }
   return seat.parentElement
+}
+
+/**
+ * One account's handle and plan: `★ ys@example.com · 计划：pro`. The star
+ * marks the default account (the one direct routes serve and the collapsed
+ * pill reads), the same glyph Settings → 订阅 uses.
+ */
+function AccountMeta({ account, translate }: { account: AccountUsageDisplay; translate: Translate }) {
+  const parts = [account.account, account.plan === undefined ? undefined : translate('usagePlan', { plan: account.plan })]
+    .filter((part): part is string => part !== undefined && part !== '')
+  return (
+    <span style={styles.providerMeta} title={account.account}>
+      {account.isDefault && <span style={styles.defaultStar} aria-label="default">★ </span>}
+      {parts.join(' · ')}
+    </span>
+  )
 }
 
 /** One `dt`/`dd` pair: window name → `25% · 6d1h`, with the bar underneath. */
@@ -485,6 +545,10 @@ const styles: Record<string, CSSProperties> = {
     color: 'var(--dsw-alias-label-tertiary)', minWidth: 0, overflow: 'hidden',
     textOverflow: 'ellipsis', whiteSpace: 'nowrap',
   },
+  // Same star and color as the default-account marker in Settings → 订阅.
+  defaultStar: { color: 'var(--dsw-alias-state-warn-label)' },
+  accountBlock: { marginTop: 8 },
+  accountRow: { display: 'flex', marginBottom: 4 },
   details: {
     color: 'var(--dsw-alias-label-tertiary)', display: 'grid',
     gridTemplateColumns: 'minmax(76px, auto) minmax(0, 1fr)', gap: '4px 16px', margin: 0,
