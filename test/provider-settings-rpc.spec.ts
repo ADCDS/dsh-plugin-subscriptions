@@ -5,9 +5,9 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { Context } from '@deepseek-ai/cordis'
-import type { ConnectionRpcHandler } from '@deepseek-ai/dsh-client-connection'
 import type { AccountAwareAdapter } from '../src/providers/accounts.js'
 import * as plugin from '../src/index.js'
+import { createFakeConnection } from './fake-connection.js'
 
 test('provider settings RPC edits picker visibility without losing the editor catalog or existing sessions', async () => {
   const home = await mkdtemp(join(tmpdir(), 'settings-rpc-'))
@@ -16,7 +16,6 @@ test('provider settings RPC edits picker visibility without losing the editor ca
   const ctx = new Context()
   const adapters = new Map<string, AccountAwareAdapter>()
   const tools = new Set<string>()
-  let handler: ConnectionRpcHandler | undefined
   ctx.provide('llm', {
     registerAdapter: (routes: string[], adapter: AccountAwareAdapter) => {
       adapter.listModels = async provider => [
@@ -27,16 +26,14 @@ test('provider settings RPC edits picker visibility without losing the editor ca
       return Object.assign(() => {}, { replace: () => {} })
     },
   })
-  ctx.provide('connection', { rpc: { handle: (_channel: string, callback: ConnectionRpcHandler) => {
-    handler = callback
-    return async () => {}
-  } } })
+  const connection = createFakeConnection()
+  ctx.provide('connection', connection.connection)
   ctx.provide('tools', { register: (definition: { name: string }) => { tools.add(definition.name); return () => {} } })
   const runtime = ctx.plugin(plugin, { providers: ['codex', 'grok'], pool: { enabled: false } })
   try {
     await new Promise(resolve => setTimeout(resolve, 50))
-    assert.ok(handler)
-    const call = (endpoint: string, payload: unknown) => handler!(endpoint, payload, new AbortController().signal)
+    assert.ok(connection.registered())
+    const call = (endpoint: string, payload: unknown) => connection.handler(endpoint, payload, new AbortController().signal)
     assert.equal((await call('setProviderSettings', { provider: 'codex', settings: { visibleModels: ['m1'], tools: { image_generate: false } } })).ok, true)
     assert.deepEqual((await adapters.get('codex')!.listModels('codex')).map(model => model.id), ['m1'])
     assert.equal((await adapters.get('codex')!.resolveModel('codex', 'm2')).id, 'm2')
