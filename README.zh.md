@@ -30,6 +30,10 @@
 
 ![速度开关及其标准/快速菜单](https://raw.githubusercontent.com/V1ki/dsh-plugin-subscriptions/main/docs/images/speed-toggle.png)
 
+输入框下方的统计行会多出一个**订阅用量**胶囊，显示当前会话所选模型对应服务商的剩余额度窗口（选 GPT 模型时显示 Codex，选 Grok 模型时显示 Grok，以此类推）。点击即可展开查看所有已登录服务商及其全部账号 —— 默认账号带星标，当前服务商排在最前：
+
+![订阅用量胶囊展开后显示所有服务商与账号](https://raw.githubusercontent.com/V1ki/dsh-plugin-subscriptions/main/docs/images/usage-badge.png)
+
 `image_generate` 工具生成的图片直接内联显示在对话里:
 
 ![image_generate 内联显示生成的图片](https://raw.githubusercontent.com/V1ki/dsh-plugin-subscriptions/main/docs/images/image-generate-inline.png)
