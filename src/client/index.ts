@@ -30,7 +30,7 @@ import { VideoGenerateToolview, createVideoLoader } from './VideoGenerateToolvie
 import type { VideoGenerateToolviewInjected } from './VideoGenerateToolview.js'
 import { SpeedSelect, createSpeedLoader, createSpeedSetter } from './SpeedSelect.js'
 import type { ModelDirectoriesLike, SpeedSelectInjected } from './SpeedSelect.js'
-import { SubscriptionUsageBadge } from './SubscriptionUsageBadge.js'
+import { SubscriptionUsageBadge, createCurrentProviderReader } from './SubscriptionUsageBadge.js'
 import type { SubscriptionUsageBadgeInjected } from './SubscriptionUsageBadge.js'
 import { en, zh } from './locales.js'
 import type { SubscriptionsKey } from './locales.js'
@@ -131,14 +131,20 @@ export function apply(ctx: ClientContext): void {
     }),
   }, SpeedSelect))
 
-  // The subscription usage badge renders a compact readout in the composer's
-  // stats strip (conversation.composer.dock) — e.g. "Claude 5h 45% · Wk 23%".
-  // A fresh id means it appears beside the shipped StatsLine, never replacing it.
+  // The subscription usage badge renders a stats pill in the composer's dock
+  // (conversation.composer.dock) — collapsed, the current model's provider
+  // (e.g. "Codex 6d1h 25%"); clicking opens every provider's windows. A fresh
+  // id means it appears beside the shipped StatsPills, never replacing them;
+  // the current-model read shares the Speed toggle's `modelDirectories` path.
   ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
     name: 'conversation.composer.dock',
     id: 'subscription-usage',
     order: 10,
-    inject: (): SubscriptionUsageBadgeInjected => ({ rpc: connection.rpc }),
+    locale: NS,
+    inject: (sessionId: string): SubscriptionUsageBadgeInjected => ({
+      rpc: connection.rpc,
+      currentProvider: createCurrentProviderReader(models, sessionId),
+    }),
   }, SubscriptionUsageBadge))
 
   // The /fast slash command offers the same Standard/Fast choice as a popup.

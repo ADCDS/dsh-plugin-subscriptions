@@ -311,8 +311,8 @@ function usageWindowLabel(t: SubscriptionsSectionInjected['t'], window: UsageWin
   return window.scope !== undefined && window.scope !== '' ? `${base} · ${window.scope}` : base
 }
 
-/** Bar fill color: success normally, warn from 80%, error from 95%. */
-function usageBarColor(usedPercent: number): string {
+/** Bar fill color: success normally, warn from 80%, error from 95%. Shared with the composer badge. */
+export function usageBarColor(usedPercent: number): string {
   if (usedPercent >= 95) return 'var(--dsw-alias-state-error-primary)'
   if (usedPercent >= 80) return 'var(--dsw-alias-state-warn-label)'
   return 'var(--dsw-alias-state-success-primary)'
