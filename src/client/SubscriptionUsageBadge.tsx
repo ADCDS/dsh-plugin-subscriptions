@@ -185,6 +185,9 @@ export function SubscriptionUsageBadge({ rpc, currentProvider, t }: Subscription
   const mountedRef = useRef(true)
   const rootRef = useRef<HTMLSpanElement | null>(null)
   const panelRef = useRef<HTMLDivElement | null>(null)
+  // Always-rendered, invisible marker in the dock: locates the composer bar
+  // (and the host stats row inside it) even while the pill itself is portaled.
+  const seatRef = useRef<HTMLSpanElement | null>(null)
   // The inject face may be re-evaluated (new callback identities) on
   // re-render; the model poll mounts once and reads through this ref.
   const currentRef = useRef(currentProvider)
@@ -300,7 +303,29 @@ export function SubscriptionUsageBadge({ rpc, currentProvider, t }: Subscription
     return () => { document.removeEventListener('keydown', onKeyDown) }
   }, [open])
 
-  if (displays.length === 0) return null
+  // Sit on the host's stats row when there is one. Every dock entry is its
+  // own row in the composer bar, so a badge rendered in place lands under the
+  // shipped time/token pills; the host marks its pill row with
+  // `data-composer-stats`, and rendering into it makes the badge a third pill
+  // on that line. The marker is watched (the row mounts only once the session
+  // has steps or tokens, and unmounts with them) and older hosts without it
+  // keep the in-place row.
+  const [statsRow, setStatsRow] = useState<HTMLElement | null>(null)
+  useEffect(() => {
+    const seat = seatRef.current
+    if (seat === null) return
+    const scope = statsScopeOf(seat)
+    if (scope === null) return
+    const find = (): HTMLElement | null => scope.querySelector<HTMLElement>('[data-composer-stats]')
+    setStatsRow(find())
+    const observer = new MutationObserver(() => { setStatsRow(find()) })
+    observer.observe(scope, { childList: true, subtree: true })
+    return () => { observer.disconnect() }
+  }, [])
+
+  const seat = <span ref={seatRef} style={styles.seat} aria-hidden />
+
+  if (displays.length === 0) return seat
 
   const collapsed = collapsedDisplays(displays, current)
   const label = collapsed.map(compactSegment).join(' | ')
@@ -313,7 +338,7 @@ export function SubscriptionUsageBadge({ rpc, currentProvider, t }: Subscription
     if (next) void refresh()
   }
 
-  return (
+  const pill = (
     <span ref={rootRef} style={styles.anchor}>
       <button
         type="button"
@@ -368,6 +393,27 @@ export function SubscriptionUsageBadge({ rpc, currentProvider, t }: Subscription
       )}
     </span>
   )
+
+  return (
+    <>
+      {seat}
+      {statsRow !== null && statsRow.isConnected ? createPortal(pill, statsRow) : pill}
+    </>
+  )
+}
+
+/**
+ * Nearest ancestor of the dock seat that can contain the host's stats row:
+ * the composer bar. Bounded so a badge in an unfamiliar layout never adopts
+ * some other composer's pills.
+ */
+function statsScopeOf(seat: HTMLElement): HTMLElement | null {
+  let node: HTMLElement | null = seat.parentElement
+  for (let depth = 0; node !== null && depth < 4; depth++) {
+    if (node.querySelector('[data-composer-stats]') !== null) return node
+    node = node.parentElement
+  }
+  return seat.parentElement
 }
 
 /** One `dt`/`dd` pair: window name → `25% · 6d1h`, with the bar underneath. */
@@ -394,6 +440,7 @@ function WindowRow({ label, window: w }: { label: string; window: UsageWindow })
 const MEASURE_STYLE: CSSProperties = { visibility: 'hidden', left: 0, top: 0 }
 
 const styles: Record<string, CSSProperties> = {
+  seat: { display: 'none' },
   anchor: { minWidth: 0, display: 'inline-flex' },
   // Mirrors the host StatsPills pill so the badge reads as a sibling of the
   // shipped time/token pills.
