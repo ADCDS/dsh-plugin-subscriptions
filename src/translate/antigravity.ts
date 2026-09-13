@@ -176,16 +176,26 @@ export function toAntigravityContents(messages: readonly TranslatableMessage[], 
   return out
 }
 
-/** Build one v1internal generateContent/streamGenerateContent request. */
+/**
+ * Build one v1internal generateContent/streamGenerateContent request.
+ * When forStreaming is true and the model is Claude, caps maxOutputTokens at 64000
+ * to avoid INVALID_ARGUMENT errors.
+ */
 export function toAntigravityRequest(
   options: GenerateOptions,
   messages: readonly TranslatableMessage[],
   projectId: string,
+  forStreaming = false,
 ): AntigravityRequest {
   const tools = toAntigravityTools(options.tools ?? [], options.model)
   const thinkingConfig = antigravityThinking(options.model, options.reasoningEffort, options.maxTokens)
+  let maxOutputTokens = options.maxTokens
+  // Claude models on the streaming path reject maxOutputTokens >= 65535
+  if (forStreaming && maxOutputTokens !== undefined && /^claude-/.test(options.model) && maxOutputTokens >= 65535) {
+    maxOutputTokens = 64000
+  }
   const generationConfig: Record<string, unknown> = {
-    ...options.maxTokens === undefined ? {} : { maxOutputTokens: options.maxTokens },
+    ...maxOutputTokens === undefined ? {} : { maxOutputTokens },
     ...options.temperature === undefined ? {} : { temperature: options.temperature },
     ...options.stop === undefined || options.stop.length === 0 ? {} : { stopSequences: options.stop },
     ...thinkingConfig === undefined ? {} : { thinkingConfig },

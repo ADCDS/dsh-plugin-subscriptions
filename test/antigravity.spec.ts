@@ -451,6 +451,17 @@ test('Antigravity reasoning uses supported runtime budgets and rejects unsupport
   assert.equal(info.reasoning?.defaultEffort, 'high')
 })
 
+test('Claude streaming caps maxOutputTokens at 64000 to avoid INVALID_ARGUMENT on high limits', () => {
+  const claudeStream = toAntigravityRequest({ ...options([]), model: 'claude-opus-4-6-thinking', maxTokens: 65536 }, [], session.projectId, true)
+  assert.equal(claudeStream.request.generationConfig?.maxOutputTokens, 64000)
+  const claudeNonStream = toAntigravityRequest({ ...options([]), model: 'claude-opus-4-6-thinking', maxTokens: 65536 }, [], session.projectId, false)
+  assert.equal(claudeNonStream.request.generationConfig?.maxOutputTokens, 65536)
+  const geminiStream = toAntigravityRequest({ ...options([]), model: 'gemini-3-flash', maxTokens: 65536 }, [], session.projectId, true)
+  assert.equal(geminiStream.request.generationConfig?.maxOutputTokens, 65536)
+  const claudeStreamLow = toAntigravityRequest({ ...options([]), model: 'claude-sonnet-4-6', maxTokens: 2048 }, [], session.projectId, true)
+  assert.equal(claudeStreamLow.request.generationConfig?.maxOutputTokens, 2048)
+})
+
 test('Antigravity replays signed text and reasoning only for the same provider and model', () => {
   const source = {
     kind: 'model' as const, provider: 'antigravity', model: 'gemini-3-flash',

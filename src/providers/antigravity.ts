@@ -656,14 +656,14 @@ export class AntigravityAdapter extends LlmAdapter {
     try {
       let session = await this.options.tokens.session(account)
       const messages = await resolveImages(options.messages, this.options.resolveAttachments?.(), watchdog.signal)
-      let payload = toAntigravityRequest(options, messages, session.projectId)
+      let payload = toAntigravityRequest(options, messages, session.projectId, true)
       let response = await requestAntigravityContent(
         session, payload, true, this.options.runtime, this.options.fetchFn, watchdog.signal,
       )
       if (response.status === 401) {
         this.clearAccountCatalog(account)
         session = await this.options.tokens.session(account, true)
-        payload = toAntigravityRequest(options, messages, session.projectId)
+        payload = toAntigravityRequest(options, messages, session.projectId, true)
         response = await requestAntigravityContent(
           session, payload, true, this.options.runtime, this.options.fetchFn, watchdog.signal,
         )
