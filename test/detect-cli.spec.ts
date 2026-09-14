@@ -6,6 +6,9 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { tmpdir } from 'node:os'
 import {
   detectClaudeVersion,
   CLAUDE_CLI_FALLBACK_VERSION,
@@ -35,6 +38,29 @@ test('detectClaudeVersion returns the fallback when claude is not in PATH', () =
   } finally {
     process.env.PATH = original
   }
+})
+
+/** A working CLI must win over the hard-coded fallback version. */
+test('detectClaudeVersion reads a resolvable CLI rather than the fallback', () => {
+  const bin = join(mkdtempSync(join(tmpdir(), 'claude-probe-')), process.platform === 'win32' ? 'claude.cmd' : 'claude')
+  const reported = '9.9.9'
+  writeFileSync(bin, process.platform === 'win32'
+    ? `@echo off\r\necho ${reported} (Claude Code)\r\n`
+    : `#!/bin/sh\necho "${reported} (Claude Code)"\n`, { mode: 0o755 })
+  const original = process.env.PATH
+  try {
+    process.env.PATH = dirname(bin)
+    assert.equal(detectClaudeVersion(), reported)
+  } finally {
+    process.env.PATH = original
+    rmSync(dirname(bin), { recursive: true, force: true })
+  }
+})
+
+/** The fallback must remain above the currently documented model floor. */
+test('detectClaudeVersion fallback is new enough for currently gated models', () => {
+  const [major, minor, patch] = CLAUDE_CLI_FALLBACK_VERSION.split('.').map(Number)
+  assert.ok(major > 2 || (major === 2 && (minor > 1 || (minor === 1 && patch >= 251))))
 })
 
 // ---------------------------------------------------------------------------
