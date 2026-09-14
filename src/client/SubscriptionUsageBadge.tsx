@@ -4,8 +4,9 @@
  * pill. Collapsed, it shows the rate-limit windows of the provider behind the
  * session's CURRENT model (a GPT model → Codex usage, a Claude model → Claude
  * usage); clicking it opens a trigger-anchored dialog listing every logged-in
- * account of every provider with all of its windows, the current provider
- * first and the default account (starred) first within a provider.
+ * account of every provider, with long window lists collapsed into previews,
+ * the current provider first and the default account (starred) first within
+ * a provider. Model-scoped Antigravity usage follows the current model.
  *
  * Usage rides the `subscriptions-auth` `status` + `usage` endpoints on a slow
  * poll (the server shares its cache across UI surfaces); the current model
@@ -48,8 +49,8 @@ const PANEL_MARGIN = 12
 export interface SubscriptionUsageBadgeInjected {
   /** Connection RPC caller to reach the `subscriptions-auth` endpoints. */
   rpc: ConnectionHandle['rpc']
-  /** Resolve the provider id behind the session's current model; undefined when unknown. */
-  currentProvider: () => Promise<string | undefined>
+  /** Resolve the session's effective provider and model together. */
+  currentModel: () => Promise<{ provider: string; model: string } | undefined>
 }
 
 /** Props delivered by the slot outlet + inject + the locale seat. */
@@ -92,21 +93,21 @@ const PROVIDER_NAMES: Record<SubscriptionProvider, string> = {
 }
 
 /**
- * The `currentProvider` half of the inject face: the session's effective
- * model provider through ui-model-selection's `modelDirectories` service,
+ * The `currentModel` half of the inject face: the session's effective
+ * model selection through ui-model-selection's `modelDirectories` service,
  * resolved lazily per call (the service may register after this plugin, and
  * a shell without it simply reports "unknown", which the badge treats as
  * "show every provider").
  */
-export function createCurrentProviderReader(
+export function createCurrentModelReader(
   models: () => ModelDirectoriesLike | undefined,
   sessionId: string,
-): SubscriptionUsageBadgeInjected['currentProvider'] {
+): SubscriptionUsageBadgeInjected['currentModel'] {
   return async () => {
     const directories = models()
     if (directories === undefined) return undefined
     const { current } = await directories.directoryFor(sessionId).load()
-    return current?.provider
+    return current ?? undefined
   }
 }
 
@@ -138,9 +139,36 @@ function usedPercent(w: UsageWindow): number {
   return Math.round(Math.min(100, Math.max(0, w.usedPercent)))
 }
 
-/** Compact one-line readout of a provider's pill account: `Codex 6d1h 25% · 1h58m 13%`. */
-export function compactSegment(d: ProviderUsageDisplay): string {
-  const parts = pillAccountOf(d).windows.map(w => `${windowLabel(w)} ${usedPercent(w)}%`)
+/** Keep model quotas separate: matching percentages do not imply a shared pool. */
+export function prioritizeWindows(windows: readonly UsageWindow[], model?: string): UsageWindow[] {
+  return model === undefined ? [...windows] : [
+    ...windows.filter(w => w.scope === model),
+    ...windows.filter(w => w.scope !== model),
+  ]
+}
+
+/** Small previews keep a live model catalog from taking over the dialog. */
+export const WINDOW_PREVIEW_LIMIT = 4
+export function previewWindows(windows: readonly UsageWindow[], model?: string) {
+  const ordered = prioritizeWindows(windows, model)
+  return { shown: ordered.slice(0, WINDOW_PREVIEW_LIMIT), hidden: ordered.slice(WINDOW_PREVIEW_LIMIT) }
+}
+
+/** Bounded readout; Antigravity quotas belong to individual models, not the account. */
+export function compactSegment(d: ProviderUsageDisplay, model?: string, t: Translate = fallbackTranslate): string {
+  const windows = pillAccountOf(d).windows
+  if (d.provider === 'antigravity') {
+    const matching = model === undefined ? [] : windows.filter(w => w.scope === model)
+    if (matching.length === 0) {
+      return `${d.name} ${t(model === undefined ? 'usageBadgeModelCount' : 'usageBadgeModelUnavailable', {
+        count: new Set(windows.map(w => w.scope).filter(Boolean)).size,
+      })}`
+    }
+    const parts = matching.slice(0, 2).map(w => `${w.kind === 'weekly' ? t('usageWeekly') : t('usageWindow')} ${usedPercent(w)}%`)
+    return `${d.name} ${parts.join(' · ')}`
+  }
+  const parts = windows.slice(0, 2).map(w => `${windowLabel(w)} ${usedPercent(w)}%`)
+  if (windows.length > 2) parts.push(`+${windows.length - 2}`)
   return `${d.name} ${parts.join(' · ')}`
 }
 
@@ -200,10 +228,11 @@ function usageWindowLabel(t: Translate, window: UsageWindow): string {
  * every provider's accounts and their windows. Returns null when no data is
  * available.
  */
-export function SubscriptionUsageBadge({ rpc, currentProvider, t }: SubscriptionUsageBadgeProps) {
+export function SubscriptionUsageBadge({ rpc, currentModel, t }: SubscriptionUsageBadgeProps) {
   const translate: Translate = t ?? fallbackTranslate
   const [displays, setDisplays] = useState<ProviderUsageDisplay[]>([])
-  const [current, setCurrent] = useState<string | undefined>(undefined)
+  const [selection, setSelection] = useState<{ provider: string; model: string } | undefined>(undefined)
+  const current = selection?.provider
   const [open, setOpen] = useState(false)
   const [hover, setHover] = useState(false)
   const inflightRef = useRef(false)
@@ -215,8 +244,8 @@ export function SubscriptionUsageBadge({ rpc, currentProvider, t }: Subscription
   const seatRef = useRef<HTMLSpanElement | null>(null)
   // The inject face may be re-evaluated (new callback identities) on
   // re-render; the model poll mounts once and reads through this ref.
-  const currentRef = useRef(currentProvider)
-  currentRef.current = currentProvider
+  const currentRef = useRef(currentModel)
+  currentRef.current = currentModel
   // Last-known-good windows per account (keyed `provider:accountKey`), kept
   // across a failed poll (e.g. a 429 during the server's own negative-cache
   // cooldown) so a row doesn't flicker away — it only disappears once the
@@ -320,7 +349,7 @@ export function SubscriptionUsageBadge({ rpc, currentProvider, t }: Subscription
       if (read === undefined || inflight) return
       inflight = true
       void read().then(
-        (provider) => { if (!cancelled) setCurrent(provider) },
+        (model) => { if (!cancelled) setSelection(model) },
         () => { /* keep the last known provider; the next tick retries */ },
       ).finally(() => { inflight = false })
     }
@@ -368,7 +397,7 @@ export function SubscriptionUsageBadge({ rpc, currentProvider, t }: Subscription
   if (displays.length === 0) return seat
 
   const collapsed = collapsedDisplays(displays, current)
-  const label = collapsed.map(compactSegment).join(' | ')
+  const label = collapsed.map(d => compactSegment(d, d.provider === current ? selection?.model : undefined, translate)).join(' | ')
   const expanded = expandedDisplays(displays, current)
   const title = translate('usageBadgeTitle')
 
@@ -424,11 +453,12 @@ export function SubscriptionUsageBadge({ rpc, currentProvider, t }: Subscription
                       <AccountMeta account={account} translate={translate} />
                     </div>
                   )}
-                  <dl style={styles.details}>
-                    {account.windows.map((w, i) => (
-                      <WindowRow key={i} label={usageWindowLabel(translate, w)} window={w} />
-                    ))}
-                  </dl>
+                  <AccountWindows
+                    key={`${d.provider}:${selection?.model ?? ''}`}
+                    windows={account.windows}
+                    model={d.provider === current ? selection?.model : undefined}
+                    translate={translate}
+                  />
                 </div>
               ))}
             </section>
@@ -477,6 +507,27 @@ function AccountMeta({ account, translate }: { account: AccountUsageDisplay; tra
   )
 }
 
+/** Preview each account independently; all remaining quotas stay accessible. */
+export function AccountWindows({ windows, model, translate }: {
+  windows: readonly UsageWindow[]; model: string | undefined; translate: Translate
+}) {
+  const { shown, hidden } = previewWindows(windows, model)
+  const rows = (items: readonly UsageWindow[]) => (
+    <dl style={styles.details}>
+      {items.map((w, i) => (
+        <WindowRow key={i} label={`${usageWindowLabel(translate, w)}${model !== undefined && w.scope === model ? ` · ${translate('usageBadgeCurrent')}` : ''}`} window={w} />
+      ))}
+    </dl>
+  )
+  return <>
+    {rows(shown)}
+    {hidden.length > 0 && <details style={styles.moreWindows}>
+      <summary style={styles.moreSummary}>{translate('usageBadgeMoreWindows', { count: hidden.length })}</summary>
+      {rows(hidden)}
+    </details>}
+  </>
+}
+
 /** One `dt`/`dd` pair: window name → `25% · 6d1h`, with the bar underneath. */
 function WindowRow({ label, window: w }: { label: string; window: UsageWindow }) {
   const percent = usedPercent(w)
@@ -502,7 +553,7 @@ const MEASURE_STYLE: CSSProperties = { visibility: 'hidden', left: 0, top: 0 }
 
 const styles: Record<string, CSSProperties> = {
   seat: { display: 'none' },
-  anchor: { minWidth: 0, display: 'inline-flex' },
+  anchor: { minWidth: 0, maxWidth: '100%', display: 'inline-flex' },
   // Mirrors the host StatsPills pill so the badge reads as a sibling of the
   // shipped time/token pills.
   pill: {
@@ -523,6 +574,7 @@ const styles: Record<string, CSSProperties> = {
     position: 'fixed', zIndex: 1100, boxSizing: 'border-box',
     background: 'var(--dsw-specific-menu)',
     width: 'max-content', minWidth: 'min(300px, 100vw - 24px)', maxWidth: 'min(440px, 100vw - 24px)',
+    maxHeight: 'min(560px, 100dvh - 24px)', overflowY: 'auto', overscrollBehavior: 'contain',
     boxShadow: 'var(--dsw-elevation-prominent)',
     color: 'var(--dsw-alias-label-secondary)', cursor: 'default',
     border: 0, borderRadius: 12, padding: 16, fontSize: 12, lineHeight: '18px',
@@ -552,9 +604,11 @@ const styles: Record<string, CSSProperties> = {
   accountRow: { display: 'flex', marginBottom: 4 },
   details: {
     color: 'var(--dsw-alias-label-tertiary)', display: 'grid',
-    gridTemplateColumns: 'minmax(76px, auto) minmax(0, 1fr)', gap: '4px 16px', margin: 0,
+    gridTemplateColumns: 'minmax(0, 1fr) max-content', gap: '4px 16px', margin: 0,
   },
-  dt: { minWidth: 0, margin: 0 },
+  moreWindows: { marginTop: 8 },
+  moreSummary: { cursor: 'pointer', color: 'var(--dsw-alias-label-secondary)', marginBottom: 8 },
+  dt: { minWidth: 0, margin: 0, overflowWrap: 'anywhere' },
   dd: {
     minWidth: 0, margin: 0, color: 'var(--dsw-alias-label-secondary)',
     fontVariantNumeric: 'tabular-nums', textAlign: 'right',

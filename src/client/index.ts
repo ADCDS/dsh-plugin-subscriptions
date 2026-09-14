@@ -30,7 +30,7 @@ import { VideoGenerateToolview, createVideoLoader } from './VideoGenerateToolvie
 import type { VideoGenerateToolviewInjected } from './VideoGenerateToolview.js'
 import { SpeedSelect, createSpeedLoader, createSpeedSetter } from './SpeedSelect.js'
 import type { ModelDirectoriesLike, SpeedSelectInjected } from './SpeedSelect.js'
-import { SubscriptionUsageBadge, createCurrentProviderReader } from './SubscriptionUsageBadge.js'
+import { SubscriptionUsageBadge, createCurrentModelReader } from './SubscriptionUsageBadge.js'
 import type { SubscriptionUsageBadgeInjected } from './SubscriptionUsageBadge.js'
 import { en, zh } from './locales.js'
 import type { SubscriptionsKey } from './locales.js'
@@ -144,7 +144,7 @@ export function apply(ctx: ClientContext): void {
     locale: NS,
     inject: (sessionId: string): SubscriptionUsageBadgeInjected => ({
       rpc: connection.rpc,
-      currentProvider: createCurrentProviderReader(models, sessionId),
+      currentModel: createCurrentModelReader(models, sessionId),
     }),
   }, SubscriptionUsageBadge))
 
