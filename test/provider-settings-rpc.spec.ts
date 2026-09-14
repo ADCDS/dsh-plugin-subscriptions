@@ -86,17 +86,14 @@ test('Antigravity registers the real multi-account adapter with provider setting
   process.env.DSH_HOME = home
   const ctx = new Context()
   const adapters = new Map<string, AccountAwareAdapter>()
-  let handler: ConnectionRpcHandler | undefined
   ctx.provide('llm', {
     registerAdapter: (routes: string[], adapter: AccountAwareAdapter) => {
       adapters.set(routes[0], adapter)
       return Object.assign(() => {}, { replace: () => {} })
     },
   })
-  ctx.provide('connection', { rpc: { handle: (_channel: string, callback: ConnectionRpcHandler) => {
-    handler = callback
-    return async () => {}
-  } } })
+  const connection = createFakeConnection()
+  ctx.provide('connection', connection.connection)
   const runtime = ctx.plugin(plugin, {
     providers: ['antigravity'], pool: { enabled: false },
     models: { antigravity: [{ id: 'm1', inputModalities: ['text', 'image'] }, { id: 'm2', inputModalities: ['text'] }] },
@@ -109,11 +106,11 @@ test('Antigravity registers the real multi-account adapter with provider setting
       await saveAccountSession('antigravity', accountKeyOf('antigravity', session), session)
     }
     await new Promise(resolve => setTimeout(resolve, 50))
-    assert.ok(handler)
+    assert.ok(connection.registered(), 'the subscriptions-auth Fetch routes were registered')
     assert.deepEqual((await listAccounts('antigravity')).map(entry => entry.key), ['alice', 'bob'])
     const adapter = adapters.get('antigravity')!
     assert.deepEqual((await adapter.listOwnModels('antigravity', 'bob')).map(model => model.id), ['m1', 'm2'])
-    const call = (endpoint: string, payload: unknown) => handler!(endpoint, payload, new AbortController().signal)
+    const call = (endpoint: string, payload: unknown) => connection.handler(endpoint, payload, new AbortController().signal)
     const catalog = await call('providerSettings', { provider: 'antigravity', force: true })
     assert.ok(catalog.ok)
     assert.deepEqual((catalog.value as { models: { id: string }[] }).models.map(model => model.id), ['m1', 'm2'])
