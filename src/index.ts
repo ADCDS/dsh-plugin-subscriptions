@@ -69,6 +69,7 @@ import { catalogStore } from './providers/catalog-store.js'
 import { CodexClientVersionCache } from './providers/codex-client-version.js'
 import { PoolAdapter } from './providers/pool.js'
 import { ImageAccountPool } from './providers/image-pool.js'
+import { registerWithAlias } from './tools/registration.js'
 import { buildAccountPools, poolKey } from './providers/pool-family.js'
 import type { PoolDefinition, PoolMemberRef } from './providers/pool-family.js'
 import { PoolHealthRegistry } from './providers/pool-health.js'
@@ -1151,12 +1152,18 @@ export function apply(ctx: Context, config: Config): void {
   // x_search and video_generate follow the grok provider; image_generate
   // prefers the codex provider and falls back to grok.
   ctx.inject(['tools'], (toolsCtx) => {
+    const registeredNames = new Map<string, string>()
     if (grokTokens !== undefined) {
-      toolsCtx.tools.register(createXSearchTool({ tokens: grokTokens }))
-      toolsCtx.tools.register(createVideoGenerateTool({ tokens: grokTokens }))
+      for (const definition of [
+        createXSearchTool({ tokens: grokTokens }),
+        createVideoGenerateTool({ tokens: grokTokens }),
+      ]) {
+        const result = registerWithAlias(toolsCtx.tools, definition)
+        if (result !== undefined) registeredNames.set(definition.name, result.name)
+      }
     }
     if (codexTokens !== undefined || grokTokens !== undefined) {
-      toolsCtx.tools.register(createImageGenerateTool({
+      const result = registerWithAlias(toolsCtx.tools, createImageGenerateTool({
         imagePool,
         ...codexTokens === undefined ? {} : { codexTokens },
         ...grokTokens === undefined ? {} : { grokTokens },
@@ -1164,6 +1171,7 @@ export function apply(ctx: Context, config: Config): void {
         resolveLlm: () => ctx.get('llm'),
         providerEnabled: (provider, createdAt) => preferences.toolEnabled(provider, 'image_generate', createdAt),
       }))
+      if (result !== undefined) registeredNames.set('image_generate', result.name)
     }
     // Restrictions are scoped to each agent. Keep global definitions registered
     // so already-open sessions retain both their schemas and execution path.
@@ -1172,13 +1180,15 @@ export function apply(ctx: Context, config: Config): void {
       const deny: string[] = []
       if (grokTokens !== undefined) {
         for (const tool of ['x_search', 'video_generate'] as const) {
-          if (!preferences.toolEnabled('grok', tool, at)) deny.push(tool)
+          const registered = registeredNames.get(tool)
+          if (registered !== undefined && !preferences.toolEnabled('grok', tool, at)) deny.push(registered)
         }
       }
       if ((codexTokens !== undefined || grokTokens !== undefined)
         && !(codexTokens !== undefined && preferences.toolEnabled('codex', 'image_generate', at))
         && !(grokTokens !== undefined && preferences.toolEnabled('grok', 'image_generate', at))) {
-        deny.push('image_generate')
+        const registered = registeredNames.get('image_generate')
+        if (registered !== undefined) deny.push(registered)
       }
       if (deny.length) agent.ctx.tools.restrict({ deny })
     })
