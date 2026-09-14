@@ -88,6 +88,7 @@ const PROVIDER_NAMES: Record<SubscriptionProvider, string> = {
   claude: 'Claude',
   grok: 'Grok',
   copilot: 'Copilot',
+  antigravity: 'Antigravity',
 }
 
 /**

@@ -9,6 +9,7 @@ export const PROVIDER_TOOLS = {
   claude: [],
   grok: ['image_generate', 'video_generate', 'x_search'],
   copilot: [],
+  antigravity: [],
 } as const
 export type SubscriptionTool = 'image_generate' | 'video_generate' | 'x_search'
 export interface ProviderPreferences {

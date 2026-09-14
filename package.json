@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-subscriptions",
   "version": "0.9.0",
-  "description": "Use ChatGPT (Codex), Claude, Grok (X Premium), and GitHub Copilot subscriptions as DeepSeek Harness LLM providers, with OAuth login from the web Settings page",
+  "description": "Use ChatGPT (Codex), Claude, Grok (X Premium), GitHub Copilot, and Google Antigravity subscriptions as DeepSeek Harness LLM providers, with OAuth login from the web Settings page",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -16,7 +16,8 @@
     "codex",
     "claude",
     "grok",
-    "github-copilot"
+    "github-copilot",
+    "google-antigravity"
   ],
   "type": "module",
   "main": "lib/index.js",

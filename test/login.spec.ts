@@ -539,3 +539,23 @@ test('auth RPC: an unknown provider is rejected, not dispatched', async () => {
     if (!result.ok) assert.equal(result.error.code, 'bad-request')
   })
 })
+
+
+test('login(antigravity): no client configuration opens the Google PKCE authorization flow', async () => {
+  await inIsolatedHome(() => withEnv('ANTIGRAVITY_CLIENT_ID', '', () => withEnv('ANTIGRAVITY_CLIENT_SECRET', '', async () => {
+    const controller = makeController(() => undefined)
+    try {
+      const { authorizeUrl } = await controller.login('antigravity')
+      const url = new URL(authorizeUrl)
+      assert.equal(url.origin + url.pathname, 'https://accounts.google.com/o/oauth2/v2/auth')
+      assert.match(url.searchParams.get('client_id') ?? '', /\.apps\.googleusercontent\.com$/)
+      assert.equal(url.searchParams.get('code_challenge_method'), 'S256')
+      assert.equal(url.searchParams.get('access_type'), 'offline')
+      assert.ok((url.searchParams.get('state') ?? '').length >= 43)
+      assert.equal(new URL(url.searchParams.get('redirect_uri')!).pathname, '/oauth-callback')
+      assert.equal(url.searchParams.has('client_secret'), false)
+    } finally {
+      await controller.cancel('antigravity')
+    }
+  })))
+})
