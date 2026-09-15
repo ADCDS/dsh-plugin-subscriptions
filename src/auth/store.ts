@@ -183,11 +183,63 @@ function claimObject(value: unknown): Record<string, unknown> | undefined {
 
 /** Resolve only recorded aliases, not an ambiguous workspace-wide match. */
 function resolveAccount(entry: ProviderAccounts<StoredSession>, key: string): string {
-  if (Object.hasOwn(entry.accounts, key)) return key
-  return entry.aliases !== undefined && Object.hasOwn(entry.aliases, key) ? entry.aliases[key] : key
+  const seen = new Set<string>()
+  while (!Object.hasOwn(entry.accounts, key)
+    && entry.aliases !== undefined
+    && Object.hasOwn(entry.aliases, key)
+    && !seen.has(key)) {
+    seen.add(key)
+    key = entry.aliases[key]
+  }
+  return key
+}
+
+/** Resolve a persisted legacy account key to its canonical account identity. */
+export async function resolveAccountKey(
+  provider: ProviderId,
+  account: string,
+  path = authFilePath(),
+): Promise<string> {
+  const entry = (await loadStore(path))[provider]
+  return entry === undefined ? account : resolveAccount(entry, account)
 }
 
 /** Migrate workspace-only keys once; retain collisions rather than discard credentials. */
+function codexEmail(session: CodexSession): string | undefined {
+  const payload = typeof session.idToken === 'string' ? decodeJwtPayload(session.idToken) : undefined
+  const profile = claimObject(payload?.['https://api.openai.com/profile'])
+  return (nonEmpty(session.emailAddress) ?? nonEmpty(payload?.email) ?? nonEmpty(profile?.email))?.toLowerCase()
+}
+
+function codexUserKey(session: CodexSession): string | undefined {
+  const key = accountKeyOf('codex', session)
+  try {
+    const tuple = JSON.parse(key) as unknown
+    return Array.isArray(tuple) && tuple[1] === 'user' ? key : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Upgrade one unambiguous email fallback to the stable user key. */
+function reconcileCodexIdentity(entry: ProviderAccounts<CodexSession>, session: CodexSession): string | undefined {
+  const userKey = codexUserKey(session)
+  const email = codexEmail(session)
+  if (userKey === undefined || email === undefined) return undefined
+  const emailKey = JSON.stringify([session.accountId, 'email', email])
+  const previous = entry.accounts[emailKey]
+  if (previous === undefined || codexEmail(previous) !== email) return undefined
+  // Never merge workspace-wide: the exact normalized workspace/email pair must match.
+  if (!Object.hasOwn(entry.accounts, userKey)) entry.accounts[userKey] = previous
+  delete entry.accounts[emailKey]
+  entry.aliases = { ...entry.aliases, [emailKey]: userKey }
+  for (const [alias, target] of Object.entries(entry.aliases)) {
+    if (target === emailKey) entry.aliases[alias] = userKey
+  }
+  if (entry.default === emailKey) entry.default = userKey
+  return userKey
+}
+
 function migrateCodex(entry: ProviderAccounts<CodexSession>): void {
   for (const [oldKey, session] of Object.entries(entry.accounts)) {
     if (oldKey !== session.accountId) continue
@@ -454,7 +506,15 @@ export async function saveAccountSession<K extends ProviderId>(
   return serialize(path, async () => {
     const store = await loadStore(path)
     const entry = store[provider] as ProviderAccounts<SessionOf<K>> | undefined
-    if (entry !== undefined) account = resolveAccount(entry, account)
+    if (entry !== undefined) {
+      account = resolveAccount(entry, account)
+      if (provider === 'codex') {
+        account = reconcileCodexIdentity(
+          entry as unknown as ProviderAccounts<CodexSession>,
+          session as unknown as CodexSession,
+        ) ?? accountKeyOf('codex', session as unknown as CodexSession)
+      }
+    }
     ;(store as Record<string, unknown>)[provider] = {
       ...entry,
       default: entry?.default ?? account,

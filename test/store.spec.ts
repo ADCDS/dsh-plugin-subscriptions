@@ -97,6 +97,32 @@ test('Codex legacy migration preserves default, references, refresh and workspac
   assert.equal((await listAccounts('codex', path))[0]?.key, b)
 })
 
+test('Codex email fallback upgrades to user identity on re-login and refresh', async () => {
+  for (const via of ['login', 'refresh'] as const) {
+    const path = storePath()
+    const emailSession = { ...CODEX, emailAddress: ' Alice@example.com ', accessToken: 'old-expired' }
+    const emailKey = accountKeyOf('codex', emailSession)
+    await saveAccountSession('codex', emailKey, emailSession, path)
+    const userSession = { ...codexUser('alice-user'), emailAddress: 'alice@example.com', accessToken: via }
+    const userKey = accountKeyOf('codex', userSession)
+    await saveAccountSession('codex', via === 'refresh' ? emailKey : userKey, userSession, path)
+    const entry = (await loadStore(path)).codex!
+    assert.deepEqual(Object.keys(entry.accounts), [userKey])
+    assert.equal(entry.default, userKey)
+    assert.equal(entry.accounts[userKey].accessToken, via)
+    assert.equal((await getAccountSession('codex', emailKey, path))?.accessToken, via)
+  }
+
+  const legacyPath = storePath()
+  const legacyEmail = { ...CODEX, emailAddress: 'alice@example.com' }
+  writeFileSync(legacyPath, JSON.stringify({ codex: { default: CODEX.accountId, accounts: { [CODEX.accountId]: legacyEmail } } }))
+  await saveAccountSession('codex', accountKeyOf('codex', codexUser('alice-user')), {
+    ...codexUser('alice-user'), emailAddress: 'alice@example.com', accessToken: 'upgraded',
+  }, legacyPath)
+  assert.equal((await getAccountSession('codex', CODEX.accountId, legacyPath))?.accessToken, 'upgraded')
+  assert.equal((await loadStore(legacyPath)).codex?.default, accountKeyOf('codex', codexUser('alice-user')))
+})
+
 test('Codex migration does not overwrite a colliding canonical entry', async () => {
   const path = storePath()
   const alice = codexUser('alice')
