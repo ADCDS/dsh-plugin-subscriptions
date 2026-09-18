@@ -21,10 +21,13 @@ import {
   getAccountSession,
   listAccounts,
   loadStore,
+  resolveAccountKey,
   saveAccountSession,
   setDefaultAccount,
 } from '../src/auth/store.js'
 import type { ClaudeSession, CodexSession } from '../src/auth/store.js'
+import { LlmError } from '@deepseek-ai/dsh-llm'
+import { AccountTokenManager } from '../src/providers/accounts.js'
 
 const TEMP_DIRS: string[] = []
 
@@ -121,6 +124,72 @@ test('Codex email fallback upgrades to user identity on re-login and refresh', a
   }, legacyPath)
   assert.equal((await getAccountSession('codex', CODEX.accountId, legacyPath))?.accessToken, 'upgraded')
   assert.equal((await loadStore(legacyPath)).codex?.default, accountKeyOf('codex', codexUser('alice-user')))
+})
+
+test('rekeyed Codex manager survives last-account logout and canonical re-login', async () => {
+  const path = storePath()
+  const emailSession = { ...CODEX, emailAddress: 'alice@example.com', expiresAt: 0 }
+  const emailKey = accountKeyOf('codex', emailSession)
+  const upgraded = { ...codexUser('alice-user'), emailAddress: emailSession.emailAddress }
+  const userKey = accountKeyOf('codex', upgraded)
+  await saveAccountSession('codex', emailKey, emailSession, path)
+  let refreshes = 0
+  let revoked = false
+  const saved: string[] = []
+  const removed: string[] = []
+  const notified: string[] = []
+  const tokens = new AccountTokenManager<CodexSession>({
+    provider: 'codex', displayName: 'Codex',
+    makeOptions: () => ({
+      preemptMs: 60_000,
+      refresh: async () => {
+        refreshes += 1
+        if (revoked) throw new Error('invalid_grant')
+        return { ...upgraded, accessToken: 'refreshed-' + refreshes }
+      },
+      isPermanent: error => error instanceof Error && error.message === 'invalid_grant',
+    }),
+    onAccountRemoved: account => { notified.push(account) },
+    io: {
+      list: () => listAccounts('codex', path),
+      get: account => getAccountSession('codex', account, path),
+      save: async (account, value) => {
+        saved.push(account)
+        await saveAccountSession('codex', account, value, path)
+      },
+      remove: async account => {
+        removed.push(account)
+        await deleteAccountSession('codex', account, path)
+      },
+      resolve: account => resolveAccountKey('codex', account, path),
+    },
+  })
+  const originalManager = tokens.tokensFor(emailKey)
+  await tokens.session()
+  assert.equal(refreshes, 1)
+  assert.equal(tokens.tokensFor(userKey), originalManager, 'rekey preserves the manager and its refresh lock')
+  assert.equal(await resolveAccountKey('codex', emailKey, path), userKey)
+
+  await deleteAccountSession('codex', userKey, path)
+  assert.equal((await loadStore(path)).codex, undefined, 'last logout removes provider and aliases')
+  await saveAccountSession('codex', userKey, { ...upgraded, accessToken: 'fresh-login' }, path)
+  assert.equal((await listAccounts('codex', path)).length, 1)
+  assert.equal(await getAccountSession('codex', emailKey, path), undefined)
+  assert.equal((await tokens.session()).accessToken, 'fresh-login')
+  assert.equal((await originalManager.peek())?.accessToken, 'fresh-login')
+
+  // Force concurrent calls to exercise the same refresh lock after rekeying.
+  const refreshed = await Promise.all([tokens.session(undefined, true), tokens.session(userKey, true)])
+  assert.deepEqual(refreshed.map(value => value.accessToken), ['refreshed-2', 'refreshed-2'])
+  assert.equal(refreshes, 2)
+  assert.deepEqual(saved, [emailKey, userKey], 'subsequent saves use the current identity')
+
+  revoked = true
+  await assert.rejects(tokens.session(userKey, true),
+    (error: unknown) => error instanceof LlmError && error.code === 'INVALID_CREDENTIAL')
+  assert.deepEqual(removed, [userKey])
+  assert.deepEqual(notified, [userKey])
+  assert.deepEqual(await listAccounts('codex', path), [])
 })
 
 test('Codex migration does not overwrite a colliding canonical entry', async () => {

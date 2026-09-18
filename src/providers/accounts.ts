@@ -193,20 +193,25 @@ export class AccountTokenManager<S extends TimedSession> {
     let manager = this.managers.get(account)
     if (manager === undefined) {
       const io = this.io
+      let boundAccount = account
       manager = new TokenManager<S>({
         displayName: this.options.displayName,
         ...this.options.makeOptions(account),
-        load: () => io.get(account),
+        load: () => io.get(boundAccount),
         save: async session => {
-          await io.save(account, session)
-          const canonical = await this.resolveAccount(account)
-          if (canonical !== account) {
+          await io.save(boundAccount, session)
+          const canonical = await this.resolveAccount(boundAccount)
+          if (canonical !== boundAccount) {
+            // Move the binding as well as the cache entry: logout can delete
+            // aliases, so callbacks must not keep relying on the old key.
+            // Retain the manager itself to preserve its in-flight refresh.
             this.managers.set(canonical, manager!)
-            if (this.managers.get(account) === manager) this.managers.delete(account)
+            if (this.managers.get(boundAccount) === manager) this.managers.delete(boundAccount)
+            boundAccount = canonical
           }
         },
-        remove: () => io.remove(account),
-        onRemoved: () => { this.options.onAccountRemoved?.(account) },
+        remove: () => io.remove(boundAccount),
+        onRemoved: () => { this.options.onAccountRemoved?.(boundAccount) },
       })
       this.managers.set(account, manager)
     }
