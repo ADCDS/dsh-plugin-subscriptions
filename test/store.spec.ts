@@ -21,10 +21,13 @@ import {
   getAccountSession,
   listAccounts,
   loadStore,
+  resolveAccountKey,
   saveAccountSession,
   setDefaultAccount,
 } from '../src/auth/store.js'
 import type { ClaudeSession, CodexSession } from '../src/auth/store.js'
+import { LlmError } from '@deepseek-ai/dsh-llm'
+import { AccountTokenManager } from '../src/providers/accounts.js'
 
 const TEMP_DIRS: string[] = []
 
@@ -59,6 +62,145 @@ test('accountKeyOf keys on the stable identity', () => {
   assert.equal(accountKeyOf('claude', CLAUDE), 'alice@example.com')
   // Sessions without an identity field fall back to a refresh-token hash.
   assert.match(accountKeyOf('claude', { ...CLAUDE, emailAddress: undefined }), /^token-[0-9a-f]{16}$/)
+})
+
+function codexUser(user: string, field = 'chatgpt_user_id'): CodexSession {
+  const payload = { 'https://api.openai.com/auth': { [field]: user } }
+  return { ...CODEX, idToken: 'header.' + Buffer.from(JSON.stringify(payload)).toString('base64url') + '.signature' }
+}
+
+test('Codex keys distinguish workspace users, remain stable and tolerate legacy claims', () => {
+  const alice = codexUser('alice')
+  assert.notEqual(accountKeyOf('codex', alice), accountKeyOf('codex', codexUser('bob')))
+  assert.equal(accountKeyOf('codex', alice), accountKeyOf('codex', codexUser('alice', 'user_id')))
+  assert.equal(accountKeyOf('codex', alice), accountKeyOf('codex', { ...alice, refreshToken: 'rotated', emailAddress: 'new@example.com' }))
+  assert.notEqual(accountKeyOf('codex', alice), accountKeyOf('codex', { ...alice, accountId: 'other-workspace' }))
+  assert.equal(accountKeyOf('codex', { ...CODEX, idToken: 'malformed' }), CODEX.accountId)
+  assert.equal(accountKeyOf('codex', { ...CODEX, emailAddress: ' ALICE@example.com ' }), accountKeyOf('codex', { ...CODEX, emailAddress: 'alice@example.com' }))
+})
+
+test('Codex legacy migration preserves default, references, refresh and workspace siblings', async () => {
+  const path = storePath()
+  const alice = codexUser('alice')
+  const bob = codexUser('bob')
+  const a = accountKeyOf('codex', alice)
+  const b = accountKeyOf('codex', bob)
+  writeFileSync(path, JSON.stringify({ codex: { default: CODEX.accountId, accounts: { [CODEX.accountId]: alice } } }))
+  assert.equal((await loadStore(path)).codex?.default, a)
+  await saveAccountSession('codex', b, bob, path)
+  await saveAccountSession('codex', CODEX.accountId, { ...alice, refreshToken: 'rotated' }, path)
+  assert.equal((await getAccountSession('codex', a, path))?.refreshToken, 'rotated')
+  assert.equal((await getAccountSession('codex', b, path))?.refreshToken, bob.refreshToken)
+  assert.deepEqual((await listAccounts('codex', path)).map(x => x.key), [a, b])
+  await setDefaultAccount('codex', b, path)
+  await setDefaultAccount('codex', CODEX.accountId, path)
+  assert.equal((await loadStore(path)).codex?.default, a)
+  await deleteAccountSession('codex', CODEX.accountId, path)
+  assert.equal(await getAccountSession('codex', CODEX.accountId, path), undefined)
+  assert.equal((await listAccounts('codex', path))[0]?.key, b)
+})
+
+test('Codex email fallback upgrades to user identity on re-login and refresh', async () => {
+  for (const via of ['login', 'refresh'] as const) {
+    const path = storePath()
+    const emailSession = { ...CODEX, emailAddress: ' Alice@example.com ', accessToken: 'old-expired' }
+    const emailKey = accountKeyOf('codex', emailSession)
+    await saveAccountSession('codex', emailKey, emailSession, path)
+    const userSession = { ...codexUser('alice-user'), emailAddress: 'alice@example.com', accessToken: via }
+    const userKey = accountKeyOf('codex', userSession)
+    await saveAccountSession('codex', via === 'refresh' ? emailKey : userKey, userSession, path)
+    const entry = (await loadStore(path)).codex!
+    assert.deepEqual(Object.keys(entry.accounts), [userKey])
+    assert.equal(entry.default, userKey)
+    assert.equal(entry.accounts[userKey].accessToken, via)
+    assert.equal((await getAccountSession('codex', emailKey, path))?.accessToken, via)
+  }
+
+  const legacyPath = storePath()
+  const legacyEmail = { ...CODEX, emailAddress: 'alice@example.com' }
+  writeFileSync(legacyPath, JSON.stringify({ codex: { default: CODEX.accountId, accounts: { [CODEX.accountId]: legacyEmail } } }))
+  await saveAccountSession('codex', accountKeyOf('codex', codexUser('alice-user')), {
+    ...codexUser('alice-user'), emailAddress: 'alice@example.com', accessToken: 'upgraded',
+  }, legacyPath)
+  assert.equal((await getAccountSession('codex', CODEX.accountId, legacyPath))?.accessToken, 'upgraded')
+  assert.equal((await loadStore(legacyPath)).codex?.default, accountKeyOf('codex', codexUser('alice-user')))
+})
+
+test('rekeyed Codex manager survives last-account logout and canonical re-login', async () => {
+  const path = storePath()
+  const emailSession = { ...CODEX, emailAddress: 'alice@example.com', expiresAt: 0 }
+  const emailKey = accountKeyOf('codex', emailSession)
+  const upgraded = { ...codexUser('alice-user'), emailAddress: emailSession.emailAddress }
+  const userKey = accountKeyOf('codex', upgraded)
+  await saveAccountSession('codex', emailKey, emailSession, path)
+  let refreshes = 0
+  let revoked = false
+  const saved: string[] = []
+  const removed: string[] = []
+  const notified: string[] = []
+  const tokens = new AccountTokenManager<CodexSession>({
+    provider: 'codex', displayName: 'Codex',
+    makeOptions: () => ({
+      preemptMs: 60_000,
+      refresh: async () => {
+        refreshes += 1
+        if (revoked) throw new Error('invalid_grant')
+        return { ...upgraded, accessToken: 'refreshed-' + refreshes }
+      },
+      isPermanent: error => error instanceof Error && error.message === 'invalid_grant',
+    }),
+    onAccountRemoved: account => { notified.push(account) },
+    io: {
+      list: () => listAccounts('codex', path),
+      get: account => getAccountSession('codex', account, path),
+      save: async (account, value) => {
+        saved.push(account)
+        await saveAccountSession('codex', account, value, path)
+      },
+      remove: async account => {
+        removed.push(account)
+        await deleteAccountSession('codex', account, path)
+      },
+      resolve: account => resolveAccountKey('codex', account, path),
+    },
+  })
+  const originalManager = tokens.tokensFor(emailKey)
+  await tokens.session()
+  assert.equal(refreshes, 1)
+  assert.equal(tokens.tokensFor(userKey), originalManager, 'rekey preserves the manager and its refresh lock')
+  assert.equal(await resolveAccountKey('codex', emailKey, path), userKey)
+
+  await deleteAccountSession('codex', userKey, path)
+  assert.equal((await loadStore(path)).codex, undefined, 'last logout removes provider and aliases')
+  await saveAccountSession('codex', userKey, { ...upgraded, accessToken: 'fresh-login' }, path)
+  assert.equal((await listAccounts('codex', path)).length, 1)
+  assert.equal(await getAccountSession('codex', emailKey, path), undefined)
+  assert.equal((await tokens.session()).accessToken, 'fresh-login')
+  assert.equal((await originalManager.peek())?.accessToken, 'fresh-login')
+
+  // Force concurrent calls to exercise the same refresh lock after rekeying.
+  const refreshed = await Promise.all([tokens.session(undefined, true), tokens.session(userKey, true)])
+  assert.deepEqual(refreshed.map(value => value.accessToken), ['refreshed-2', 'refreshed-2'])
+  assert.equal(refreshes, 2)
+  assert.deepEqual(saved, [emailKey, userKey], 'subsequent saves use the current identity')
+
+  revoked = true
+  await assert.rejects(tokens.session(userKey, true),
+    (error: unknown) => error instanceof LlmError && error.code === 'INVALID_CREDENTIAL')
+  assert.deepEqual(removed, [userKey])
+  assert.deepEqual(notified, [userKey])
+  assert.deepEqual(await listAccounts('codex', path), [])
+})
+
+test('Codex migration does not overwrite a colliding canonical entry', async () => {
+  const path = storePath()
+  const alice = codexUser('alice')
+  const key = accountKeyOf('codex', alice)
+  writeFileSync(path, JSON.stringify({ codex: { default: CODEX.accountId, accounts: { [CODEX.accountId]: alice, [key]: { ...alice, refreshToken: 'other' } } } }))
+  const entry = (await loadStore(path)).codex!
+  assert.equal(Object.keys(entry.accounts).length, 2)
+  assert.equal(entry.default, CODEX.accountId)
+  assert.equal(entry.accounts[key].refreshToken, 'other')
 })
 
 test('two providers refreshing at once both keep their session', async () => {
@@ -139,8 +281,9 @@ test('a single-account store migrates on read, preserving every field', async ()
   }), { mode: 0o600 })
   const store = await loadStore(path)
   assert.deepEqual(store.codex, {
-    default: 'acct-1',
-    accounts: { 'acct-1': { ...CODEX, emailAddress: 'alice@example.com', planType: 'pro' } },
+    default: accountKeyOf('codex', { ...CODEX, emailAddress: 'alice@example.com' }),
+    aliases: { 'acct-1': accountKeyOf('codex', { ...CODEX, emailAddress: 'alice@example.com' }) },
+    accounts: { [accountKeyOf('codex', { ...CODEX, emailAddress: 'alice@example.com' })]: { ...CODEX, emailAddress: 'alice@example.com', planType: 'pro' } },
   })
   assert.deepEqual(store.claude, {
     default: 'alice@example.com',
