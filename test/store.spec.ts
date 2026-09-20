@@ -339,3 +339,21 @@ test('a valid account survives alongside a corrupt sibling of the same provider'
   const entries = await listAccounts('codex', path)
   assert.deepEqual(entries.map((entry) => entry.key), ['acct-1'], 'only the valid account is listed')
 })
+
+test('Codex config references resolve by unique email or workspace ID, never ambiguously', async () => {
+  const path = storePath()
+  const alice = { ...codexUser('alice-user'), emailAddress: 'Alice@Example.com' }
+  const aliceKey = accountKeyOf('codex', alice)
+  await saveAccountSession('codex', aliceKey, alice, path)
+  assert.equal(await resolveAccountKey('codex', 'alice@example.com', path), aliceKey, 'login email resolves')
+  assert.equal(await resolveAccountKey('codex', CODEX.accountId, path), aliceKey, 'sole workspace user resolves')
+  assert.equal(await resolveAccountKey('codex', aliceKey, path), aliceKey, 'a real key is untouched')
+  assert.equal(await resolveAccountKey('codex', 'nobody@example.com', path), 'nobody@example.com')
+
+  const bob = { ...codexUser('bob-user'), emailAddress: 'bob@example.com' }
+  await saveAccountSession('codex', accountKeyOf('codex', bob), bob, path)
+  assert.equal(await resolveAccountKey('codex', CODEX.accountId, path), CODEX.accountId,
+    'a shared workspace ID is ambiguous and stays unresolved')
+  assert.equal(await resolveAccountKey('codex', 'bob@example.com', path), accountKeyOf('codex', bob))
+  assert.equal(await resolveAccountKey('claude', 'alice@example.com', path), 'alice@example.com', 'other providers unchanged')
+})

@@ -194,14 +194,38 @@ function resolveAccount(entry: ProviderAccounts<StoredSession>, key: string): st
   return key
 }
 
-/** Resolve a persisted legacy account key to its canonical account identity. */
+/**
+ * Resolve a Codex reference that is neither a stored key nor a recorded alias:
+ * a config `account` may name the login email (as the other providers' keys
+ * do) or the bare workspace ID that keys stored before per-user keys. Only an
+ * unambiguous match resolves; two users sharing the workspace stay apart, and
+ * the reference is returned unchanged so the caller reports it as missing.
+ */
+function resolveCodexReference(entry: ProviderAccounts<CodexSession>, reference: string): string {
+  const wanted = reference.trim().toLowerCase()
+  if (wanted.length === 0) return reference
+  const matches = Object.entries(entry.accounts).filter(([, session]) =>
+    session.accountId === reference.trim() || codexEmail(session) === wanted)
+  return matches.length === 1 ? matches[0][0] : reference
+}
+
+/**
+ * Resolve a persisted legacy account key to its canonical account identity.
+ * For Codex, a reference that matches no key or alias also resolves through
+ * a unique login email or workspace ID (see {@link resolveCodexReference}).
+ */
 export async function resolveAccountKey(
   provider: ProviderId,
   account: string,
   path = authFilePath(),
 ): Promise<string> {
   const entry = (await loadStore(path))[provider]
-  return entry === undefined ? account : resolveAccount(entry, account)
+  if (entry === undefined) return account
+  const key = resolveAccount(entry, account)
+  if (provider === 'codex' && !Object.hasOwn(entry.accounts, key)) {
+    return resolveCodexReference(entry as ProviderAccounts<CodexSession>, key)
+  }
+  return key
 }
 
 /** Migrate workspace-only keys once; retain collisions rather than discard credentials. */
