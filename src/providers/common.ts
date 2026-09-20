@@ -315,6 +315,8 @@ export interface TokenManagerOptions<S extends TimedSession> {
  */
 export class TokenManager<S extends TimedSession> {
   private inflight: Promise<S> | undefined
+  /** The session whose refresh token the in-flight refresh is spending. */
+  private attempted: S | undefined
 
   constructor(private readonly options: TokenManagerOptions<S>) {
     this.options = options
@@ -363,6 +365,14 @@ export class TokenManager<S extends TimedSession> {
       return await this.inflight
     } catch (error) {
       if (this.options.isPermanent(error)) {
+        // A re-login may have landed while this refresh was failing: its
+        // session carries a different refresh token, and deleting it would
+        // log out an account that just signed in. Serve it instead.
+        const attempted = this.attempted
+        const stored = await this.options.load()
+        if (stored !== undefined && attempted !== undefined && stored.refreshToken !== attempted.refreshToken) {
+          return stored
+        }
         await this.options.remove()
         this.options.onRemoved?.()
         throw new LlmError(
@@ -390,7 +400,9 @@ export class TokenManager<S extends TimedSession> {
       && current.expiresAt - Date.now() > this.options.preemptMs) {
       return current
     }
-    const next = await this.options.refresh(current ?? session)
+    const attempted = current ?? session
+    this.attempted = attempted
+    const next = await this.options.refresh(attempted)
     await this.options.save(next)
     return next
   }

@@ -177,3 +177,33 @@ test('peek and hasSession read without refreshing', async () => {
   assert.equal(await tokens.hasSession('nobody'), false)
   assert.deepEqual(refreshes, [])
 })
+
+test('a permanent refresh failure keeps a session that a concurrent re-login just saved', async () => {
+  let reject!: (error: Error) => void
+  const gate = new Promise<TestSession>((_, fail) => { reject = fail })
+  const { tokens, stored, removed, notified } = harness({
+    accounts: { a1: session('stale', -1) },
+    refresh: () => gate,
+    permanent: (_account, error) => error instanceof Error && error.message === 'invalid_grant',
+  })
+  const pending = tokens.session('a1')
+  await new Promise(resolve => setTimeout(resolve, 10))
+  stored.set('a1', session('fresh-login'))
+  reject(new Error('invalid_grant'))
+  assert.equal((await pending).accessToken, 'fresh-login', 'the re-login is served, not deleted')
+  assert.deepEqual(removed, [])
+  assert.deepEqual(notified, [])
+  assert.equal(stored.get('a1')?.accessToken, 'fresh-login')
+})
+
+test('a permanent refresh failure still removes the account when nothing replaced it', async () => {
+  const { tokens, stored, removed, notified } = harness({
+    accounts: { a1: session('stale', -1) },
+    refresh: () => Promise.reject(new Error('invalid_grant')),
+    permanent: (_account, error) => error instanceof Error && error.message === 'invalid_grant',
+  })
+  await assert.rejects(tokens.session('a1'), (error: unknown) => error instanceof LlmError && error.code === 'INVALID_CREDENTIAL')
+  assert.deepEqual(removed, ['a1'])
+  assert.deepEqual(notified, ['a1'])
+  assert.equal(stored.has('a1'), false)
+})
