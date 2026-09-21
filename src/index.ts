@@ -1182,11 +1182,19 @@ export function apply(ctx: Context, config: Config): void {
 
   // `web` is optional on headless/minimal compositions. Register Codex behind
   // DSH's native web_search tool when the capability seam is mounted.
+  //
+  // `web_search` is the host's tool, not one this plugin registers, so the
+  // Codex switch gates this provider's `available()` rather than the tool
+  // itself: turned off, the seam auto-selects another registered provider, or
+  // reports WEB_PROVIDER_UNAVAILABLE the way dsh-tool-web expects. Denying the
+  // tool per agent would instead take web_search away from every other
+  // provider in the composition.
   if (codexTokens !== undefined) {
     const tokens = codexTokens
     ctx.inject(['web'], webCtx => {
       webCtx.web.registerSearchProvider(new CodexWebSearchProvider({
         tokens,
+        enabled: () => preferences.toolEnabled('codex', 'web_search'),
         fetchFn: proxiedFetch,
       }))
     })
@@ -1223,7 +1231,6 @@ export function apply(ctx: Context, config: Config): void {
     toolsCtx.on('agent/created', ({ agent }) => {
       const at = agent.session.header.createdAt
       const deny: string[] = []
-      if (codexTokens !== undefined && !preferences.toolEnabled('codex', 'web_search', at)) deny.push('web_search')
       if (grokTokens !== undefined) {
         for (const tool of ['x_search', 'video_generate'] as const) {
           const registered = registeredNames.get(tool)

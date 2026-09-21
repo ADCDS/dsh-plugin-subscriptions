@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { WebRuntime } from '@deepseek-ai/dsh-web'
 import { Context } from '@deepseek-ai/cordis'
 import {
-  CODEX_SEARCH_FALLBACK_MODEL,
+  CODEX_SEARCH_MODEL,
   CODEX_SEARCH_URL,
   CodexWebSearchProvider,
   normalizeCodexSearchResponse,
@@ -37,8 +37,12 @@ test('Codex Web Search sends the standalone contract and normalizes citations', 
   const headers = new Headers(captured?.headers)
   assert.equal(headers.get('authorization'), 'Bearer secret')
   assert.equal(headers.get('chatgpt-account-id'), 'acct-1')
+  // Same originator as every other Codex call in this plugin; a plugin-specific
+  // value is not a client ChatGPT's Codex backend knows.
+  assert.equal(headers.get('originator'), 'codex_cli_rs')
+  assert.match(String(headers.get('user-agent')), /\S/)
   assert.deepEqual(JSON.parse(String(captured?.body)), {
-    id: 'request-1', model: CODEX_SEARCH_FALLBACK_MODEL, input: 'DeepSeek Harness',
+    id: 'request-1', model: CODEX_SEARCH_MODEL, input: 'DeepSeek Harness',
     commands: { search_query: [{ q: 'DeepSeek Harness' }] },
     settings: { search_context_size: 'medium', allowed_callers: ['direct'], external_web_access: 'live' },
     max_output_tokens: 2048,
@@ -92,4 +96,45 @@ test('Codex response normalization rejects invalid envelopes and unsafe sources'
   assert.deepEqual(normalizeCodexSearchResponse({ output: 'ok', results: [
     { url: 'javascript:alert(1)' }, { url: 'https://example.com', title: 'bad\ncontrol' },
   ] }), { content: 'ok', sources: [{ url: 'https://example.com/' }], truncated: false })
+})
+
+test('the Codex web_search switch drives provider availability, not the host tool', async () => {
+  const fetchFn = async () => new Response(JSON.stringify({ output: 'ok', results: [] }))
+  assert.equal(provider(fetchFn).available(), true, 'absent switch counts as enabled')
+
+  let enabled = true
+  const gated = new CodexWebSearchProvider({
+    tokens: { session: async () => session }, fetchFn, enabled: () => enabled,
+  })
+  assert.equal(gated.available(), true)
+  enabled = false
+  // Read per call: flipping the switch must not need a re-registration.
+  assert.equal(gated.available(), false)
+})
+
+test('a disabled Codex provider releases the seam instead of holding it', async () => {
+  const ctx = new Context()
+  const web = new WebRuntime(ctx)
+  let enabled = false
+  web.registerSearchProvider(new CodexWebSearchProvider({
+    tokens: { session: async () => session },
+    fetchFn: async () => new Response(JSON.stringify({ output: 'codex', results: [] })),
+    enabled: () => enabled,
+  }))
+  // Sole provider, switched off: the seam reports its own unavailable error
+  // rather than running Codex or losing the host's tool.
+  await assert.rejects(web.search({ query: 'q' }),
+    (error: unknown) => (error as { code?: string }).code === 'WEB_PROVIDER_UNAVAILABLE')
+
+  // A second provider must win while Codex is off, and collide once it is on:
+  // this is why the plugin no longer pins `searchProvider` for the whole host.
+  web.registerSearchProvider({
+    id: 'other', available: () => true,
+    search: async () => ({ content: 'other', sources: [], truncated: false }),
+  })
+  assert.equal((await web.search({ query: 'q' })).content, 'other')
+  enabled = true
+  await assert.rejects(web.search({ query: 'q' }),
+    (error: unknown) => (error as { code?: string }).code === 'WEB_PROVIDER_AMBIGUOUS')
+  await ctx.fiber.dispose()
 })

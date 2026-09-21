@@ -1,5 +1,6 @@
 /** Codex-backed provider for DSH's native web_search capability. */
 import { randomUUID } from 'node:crypto'
+import { attributionHeaders } from '@deepseek-ai/dsh-llm'
 import { WebError } from '@deepseek-ai/dsh-web'
 import type { WebSearchProvider, WebSearchRequest, WebSearchResult, WebSearchSource } from '@deepseek-ai/dsh-web'
 import type { CodexSession } from '../auth/store.js'
@@ -7,16 +8,22 @@ import type { AccountTokenManager } from '../providers/accounts.js'
 
 export const CODEX_SEARCH_PROVIDER_ID = 'codex'
 export const CODEX_SEARCH_URL = 'https://chatgpt.com/backend-api/codex/alpha/search'
-export const CODEX_SEARCH_FALLBACK_MODEL = 'gpt-5.6-terra'
+export const CODEX_SEARCH_MODEL = 'gpt-5.6-terra'
 const MAX_ATTEMPTS = 5
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 const RETRY_BASE_MS = 100
 
 export interface CodexWebSearchOptions {
   tokens: Pick<AccountTokenManager<CodexSession>, 'session'>
+  /**
+   * Current state of the Codex `web_search` tool switch. Absent counts as
+   * enabled. Read on every {@link CodexWebSearchProvider.available} call so
+   * turning the switch off releases the seam to another search provider
+   * instead of denying the host's tool.
+   */
+  enabled?: () => boolean
   fetchFn?: typeof fetch
   requestId?: () => string
-  model?: () => string | undefined
   retryBaseMs?: number
 }
 
@@ -26,7 +33,7 @@ export class CodexWebSearchProvider implements WebSearchProvider {
 
   constructor(private readonly options: CodexWebSearchOptions) {}
 
-  available(): boolean { return true }
+  available(): boolean { return this.options.enabled?.() ?? true }
 
   async search(request: WebSearchRequest, signal?: AbortSignal): Promise<WebSearchResult> {
     throwIfAborted(signal)
@@ -42,7 +49,7 @@ export class CodexWebSearchProvider implements WebSearchProvider {
     }
     const body = {
       id: this.options.requestId?.() ?? randomUUID(),
-      model: this.options.model?.() ?? CODEX_SEARCH_FALLBACK_MODEL,
+      model: CODEX_SEARCH_MODEL,
       input: request.query,
       commands: { search_query: [{ q: request.query }] },
       settings: {
@@ -66,11 +73,11 @@ export class CodexWebSearchProvider implements WebSearchProvider {
         response = await fetchFn(CODEX_SEARCH_URL, {
           method: 'POST',
           headers: {
-            authorization: `Bearer ${session.accessToken}`,
+            'authorization': `Bearer ${session.accessToken}`,
             'chatgpt-account-id': session.accountId,
             'content-type': 'application/json',
-            originator: 'dsh-plugin-subscriptions',
-            'user-agent': 'dsh-plugin-subscriptions',
+            'originator': 'codex_cli_rs',
+            ...attributionHeaders(),
           },
           body: JSON.stringify(body),
           ...(signal === undefined ? {} : { signal }),

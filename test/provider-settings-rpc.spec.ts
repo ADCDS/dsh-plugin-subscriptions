@@ -66,11 +66,13 @@ test('provider settings RPC edits picker visibility without losing the editor ca
     }
     const old = create(Date.now() - 1000)
     assert.deepEqual(old, [])
-    // Grok still supplies image_generate while only Codex is disabled.
-    assert.deepEqual(create(Date.now() + 1000), ['web_search'])
+    // Grok still supplies image_generate while only Codex is disabled, and a
+    // disabled Codex web_search withdraws this plugin's search provider rather
+    // than denying the host's own web_search tool to every other provider.
+    assert.deepEqual(create(Date.now() + 1000), [])
     assert.equal((await call('setProviderSettings', { provider: 'grok', settings: { tools: { image_generate: false, video_generate: false } } })).ok, true)
     assert.deepEqual(old, [])
-    assert.deepEqual(create(Date.now() + 1000).sort(), ['image_generate', 'video_generate', 'web_search'])
+    assert.deepEqual(create(Date.now() + 1000).sort(), ['image_generate', 'video_generate'])
     assert.deepEqual([...tools].sort(), ['image_generate', 'video_generate', 'x_search'])
     assert.equal((await call('setProviderSettings', { provider: 'codex', settings: {} })).ok, true)
     assert.equal((await adapters.get('codex')!.listModels('codex')).length, 2)
