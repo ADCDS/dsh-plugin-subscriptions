@@ -397,6 +397,14 @@ export async function fetchClaudeUsage(
   return { supported: true, windows }
 }
 
+/** One entry of the claude models API catalog. */
+interface ClaudeCatalogModel {
+  id?: string
+  display_name?: string
+  max_input_tokens?: number
+  capabilities?: ClaudeModelCapabilities
+}
+
 interface ClaudeModelCapabilities {
   thinking?: {
     types?: {
@@ -451,19 +459,25 @@ export async function fetchClaudeModels(
   })
   if (!response.ok) throw await httpLlmError(response, 'claude models API')
   const payload = await response.json() as {
-    data?: Array<{ id?: string; display_name?: string; capabilities?: ClaudeModelCapabilities }>
+    data?: Array<ClaudeCatalogModel>
   }
   if (!Array.isArray(payload.data)) {
     throw new Error('claude models API returned an invalid catalog')
   }
   const models: DiscoveredModel[] = payload.data
-    .filter((m): m is { id: string; display_name?: string; capabilities?: ClaudeModelCapabilities } => typeof m.id === 'string')
+    .filter((m): m is ClaudeCatalogModel & { id: string } => typeof m.id === 'string')
     .map((m) => {
       const thinkingType = claudeThinkingType(m.capabilities)
       const reasoning = claudeReasoning(m.capabilities)
+      // The catalog advertises each model's input ceiling; without it every
+      // model falls back to the built-in default window.
+      const contextWindow = Number.isInteger(m.max_input_tokens) && (m.max_input_tokens ?? 0) > 0
+        ? m.max_input_tokens
+        : undefined
       return {
         id: m.id,
         name: m.display_name ?? m.id,
+        ...contextWindow === undefined ? {} : { contextWindow },
         ...thinkingType === undefined ? {} : { thinkingType },
         ...reasoning === undefined ? {} : { reasoning },
       }
