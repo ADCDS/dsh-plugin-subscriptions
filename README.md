@@ -264,6 +264,28 @@ The optional plugin override remains available for supported older DSH hosts and
 
 Changes apply immediately to subsequent requests — no restart needed. The OAuth authorization page opens in your browser and follows the browser/system proxy, not this setting. SOCKS proxies are not supported.
 
+## Usage feed
+
+Local tools (status bars, Stream Deck and other hardware displays) cannot use the Settings page's usage endpoint: it sits behind the dsh web session cookie, which only a browser holds. The optional usage feed serves the same data on a separate loopback HTTP server:
+
+```yaml
+- id: llm-subscriptions
+  config:
+    usageFeed:
+      enabled: true      # off by default
+      host: 127.0.0.1    # loopback only; anything else fails at load
+      port: 8771
+```
+
+```sh
+curl -H "Authorization: Bearer $(cat ~/.dsh/plugins/subscriptions/usage-feed.token)" \
+  http://127.0.0.1:8771/usage
+```
+
+`GET /usage` returns every logged-in account of each configured provider with its usage windows (`kind`, optional model `scope`, `usedPercent`, `resetsAt` in epoch milliseconds), plan name and account label. It never returns credentials. An account whose lookup fails carries an `error` field instead of `usage`, so one account never fails the whole response.
+
+The feed reads through the same usage path as the Settings page, including the pool's five-minute cache and its rate-limit cooldown, so polling it frequently adds no upstream traffic. The bearer token is generated on first start into `~/.dsh/plugins/subscriptions/usage-feed.token` (mode 0600); delete the file and restart to rotate it. Requests carrying an `Origin` header are refused, so a web page cannot read the feed.
+
 ## Related plugins
 
 This plugin only supplies model routes. Approval policy lives elsewhere:

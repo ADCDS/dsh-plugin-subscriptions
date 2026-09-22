@@ -131,6 +131,7 @@ import { createImageGenerateTool } from './tools/image-generate.js'
 import { createVideoGenerateTool, videosDirectory } from './tools/video-generate.js'
 import { proxiedFetch, proxyGetConfig, proxySetConfig, proxyTestConnection } from './http.js'
 import { ProviderSettingsStore, PROVIDER_TOOLS, validatePreferences } from './provider-settings.js'
+import { resolveUsageFeed, startUsageFeed, USAGE_FEED_DEFAULT_PORT, type UsageFeedConfig, type UsageFeedSource } from './usage-feed.js'
 
 export type { ModelEntry, ProviderUsage, UsageWindow } from './providers/common.js'
 export type { RateLimitConfig, RateLimitWait } from './providers/rate-limit.js'
@@ -173,6 +174,8 @@ export interface Config {
     clientSecret?: string
   }
   /** Same-subscription account pools (and optional extra tier models). */
+  /** Loopback, token-authenticated read-only usage endpoint for local tools (off by default). */
+  usageFeed?: UsageFeedConfig
   pool?: {
     /** Enable account pooling (default true; needs ≥2 accounts of one provider). */
     enabled?: boolean
@@ -228,6 +231,11 @@ export const Config: z<Config> = z.object({
     baseURL: z.string(),
     userAgent: z.string(),
     onboard: z.boolean().default(true),
+  }),
+  usageFeed: z.object({
+    enabled: z.boolean().default(false),
+    host: z.string().default('127.0.0.1'),
+    port: z.natural().min(1).max(65535).default(USAGE_FEED_DEFAULT_PORT),
   }),
   pool: z.object({
     enabled: z.boolean().default(true),
@@ -1092,9 +1100,38 @@ export function apply(ctx: Context, config: Config): void {
       handles.get(provider)?.replace([provider])
     },
   }
-  registerAuthRpc(ctx, new SubscriptionsAuthController(
+  const authController = new SubscriptionsAuthController(
     flows, deviceFlows, authChanged, resolveAttachments, usageFetchers, undefined, poolUsage, config.antigravity,
-  ), speed, {
+  )
+  const feedAddress = resolveUsageFeed(config.usageFeed, `${name}: usageFeed`)
+  if (feedAddress !== undefined) {
+    // Same controller as the Settings page, so the feed reads the same cached
+    // usage snapshots and never adds upstream traffic of its own.
+    const feedSource: UsageFeedSource = {
+      providers,
+      accounts: async provider => (await authController.status(provider)).accounts.map(entry => ({
+        key: entry.key,
+        isDefault: entry.isDefault,
+        ...entry.account === undefined ? {} : { account: entry.account },
+        ...entry.plan === undefined ? {} : { plan: entry.plan },
+      })),
+      usage: (provider, key, signal) => authController.usage(provider, key, signal),
+    }
+    ctx.effect(() => {
+      const closing = startUsageFeed(feedAddress, feedSource, onWarn).then(
+        (close) => {
+          ctx.logger.info(`dsh-plugin-subscriptions: usage feed on http://${feedAddress.host}:${String(feedAddress.port)}/usage`)
+          return close
+        },
+        (error: unknown) => {
+          onWarn(`usage feed failed to start: ${error instanceof Error ? error.message : String(error)}`)
+          return undefined
+        },
+      )
+      return async () => { await (await closing)?.() }
+    }, 'dsh-plugin-subscriptions: usage feed server')
+  }
+  registerAuthRpc(ctx, authController, speed, {
     get: () => proxyGetConfig(),
     set: input => proxySetConfig(input),
     test: payload => proxyTestConnection(payload.url, payload.proxy),
