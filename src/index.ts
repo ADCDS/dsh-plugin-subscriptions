@@ -256,6 +256,12 @@ const DEFAULT_MODELS: Record<ProviderId, ModelEntry[]> = {
     { id: 'gpt-5.1', name: 'GPT-5.1' },
   ],
   claude: [
+    // Every adaptive-thinking model needs an explicit output cap here: an
+    // unlisted model falls back to CLAUDE_DEFAULT_MAX_TOKENS (32k), which
+    // max-effort thinking can exhaust in a single step, ending the turn with
+    // `max-tokens` and no text or tool call.
+    { id: 'claude-opus-5-5', name: 'Claude Opus 5.5', maxTokens: 128_000, contextWindow: 1_000_000 },
+    { id: 'claude-fable-5-1', name: 'Claude Fable 5.1', maxTokens: 128_000, contextWindow: 1_000_000 },
     { id: 'claude-opus-5', name: 'Claude Opus 5', maxTokens: 128_000, contextWindow: 1_000_000 },
     { id: 'claude-sonnet-5', name: 'Claude Sonnet 5', maxTokens: 128_000, contextWindow: 1_000_000 },
     { id: 'claude-fable-5', name: 'Claude Fable 5', maxTokens: 128_000, contextWindow: 1_000_000 },
