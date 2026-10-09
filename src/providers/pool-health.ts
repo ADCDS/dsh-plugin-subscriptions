@@ -29,6 +29,10 @@ export const DEFAULT_QUOTA_COOLDOWN_MS = 5 * 60_000
 export const AUTH_COOLDOWN_MS = 24 * 60 * 60_000
 /** Transient server-side failures cool down briefly. */
 export const TRANSIENT_COOLDOWN_MS = 60_000
+/** A Codex 429 without a disclosed reset may be a short burst throttle, not an exhausted subscription. */
+export const CODEX_BURST_COOLDOWN_MS = 2_000
+/** Codex pre-output server errors may clear quickly; retry only after this quiet period. */
+export const CODEX_TRANSIENT_COOLDOWN_MS = 2_000
 
 /** Whether a failure parks one member or the account's whole quota. */
 export type PoolFailureScope = 'member' | 'account'
@@ -41,12 +45,14 @@ export type PoolFailureAction =
 
 /**
  * Providers whose quota windows are model-scoped, so a quota failure on one
- * model says nothing about its siblings (Claude's Opus/Sonnet lanes). Every
- * other provider meters the account as a whole: one member hitting the wall
- * means its siblings on the SAME account would too, so the cooldown parks
- * the account (other accounts of the provider are unaffected).
+ * model says nothing about its siblings (Claude's Opus/Sonnet lanes;
+ * Antigravity's per-model quotas, whose 429 names the exhausted model and
+ * can disclose a reset 35 hours out that must not park its Gemini siblings).
+ * Every other provider meters the account as a whole: one member hitting the
+ * wall means its siblings on the SAME account would too, so the cooldown
+ * parks the account (other accounts of the provider are unaffected).
  */
-const MODEL_SCOPED_QUOTA_PROVIDERS: ReadonlySet<ProviderId> = new Set(['claude'])
+const MODEL_SCOPED_QUOTA_PROVIDERS: ReadonlySet<ProviderId> = new Set(['claude', 'antigravity'])
 
 /** The `retry-after` an adapter propagated through `httpLlmError`, when any. */
 function retryAfterMs(error: LlmError): number | undefined {
@@ -73,8 +79,12 @@ export function classifyPoolFailure(error: unknown, provider: ProviderId): PoolF
     case 'RATE_LIMIT':
       return {
         action: 'switch',
-        cooldownMs: retryAfterMs(error) ?? DEFAULT_QUOTA_COOLDOWN_MS,
-        reason: error.code,
+        // Codex can issue a burst 429 while the subscription still has quota.
+        // Only a 429 with no disclosed reset gets a short, bounded probe delay.
+        cooldownMs: retryAfterMs(error) ?? (provider === 'codex' && error.code === 'RATE_LIMIT' && error.failure.status === 429
+          ? CODEX_BURST_COOLDOWN_MS : DEFAULT_QUOTA_COOLDOWN_MS),
+        reason: provider === 'codex' && error.code === 'RATE_LIMIT' && error.failure.status === 429
+          && retryAfterMs(error) === undefined ? 'CODEX_BURST_429' : error.code,
         scope: MODEL_SCOPED_QUOTA_PROVIDERS.has(provider) ? 'member' : 'account',
       }
     case 'AUTH':
@@ -84,7 +94,7 @@ export function classifyPoolFailure(error: unknown, provider: ProviderId): PoolF
     case 'SERVER':
     case 'TIMEOUT':
     case 'EMPTY_RESPONSE':
-      return { action: 'switch', cooldownMs: TRANSIENT_COOLDOWN_MS, reason: error.code, scope: 'member' }
+      return { action: 'switch', cooldownMs: retryAfterMs(error) ?? (provider === 'codex' ? CODEX_TRANSIENT_COOLDOWN_MS : TRANSIENT_COOLDOWN_MS), reason: error.code, scope: 'member' }
     case 'TRANSPORT':
       return { action: 'switch' }
     case 'HTTP_402':
@@ -105,6 +115,14 @@ interface HealthRecord {
   reason: string
 }
 
+/** One cooling record, named by its registry key (feeds the exhausted-pool diagnosis). */
+export interface CoolingRecord {
+  key: string
+  unavailableUntil: number
+  /** The failure code that parked the member (`RATE_LIMIT`, `AUTH`, `SERVER`, …). */
+  reason: string
+}
+
 /**
  * Cooldown registry keyed by {@link memberKey}. A member whose cooldown has
  * expired is simply available again — recovery is proven by the next real
@@ -121,13 +139,28 @@ export class PoolHealthRegistry {
 
   /** Whether one registry key is clear right now. */
   isAvailable(key: string, now = Date.now()): boolean {
-    const record = this.records.get(key)
-    if (record === undefined) return true
-    if (record.unavailableUntil <= now) {
-      this.records.delete(key)
-      return true
+    return this.record(key, now) === undefined
+  }
+
+  /** Live cooldown of a member, including the account-wide record, if any. */
+  memberCooldown(provider: ProviderId, account: string, model: string, now = Date.now()):
+    { until: number; reason: string; scope: PoolFailureScope } | undefined {
+    const accountRecord = this.record(accountKey(provider, account), now)
+    const memberRecord = this.record(memberKey(provider, account, model), now)
+    if (accountRecord === undefined && memberRecord === undefined) return undefined
+    if (memberRecord !== undefined && (accountRecord === undefined || memberRecord.unavailableUntil > accountRecord.unavailableUntil)) {
+      return { until: memberRecord.unavailableUntil, reason: memberRecord.reason, scope: 'member' }
     }
-    return false
+    return { until: accountRecord!.unavailableUntil, reason: accountRecord!.reason, scope: 'account' }
+  }
+
+  private record(key: string, now: number): HealthRecord | undefined {
+    const record = this.records.get(key)
+    if (record !== undefined && record.unavailableUntil <= now) {
+      this.records.delete(key)
+      return undefined
+    }
+    return record
   }
 
   /** Park a member for `cooldownMs`; a longer existing cooldown wins. */
@@ -147,15 +180,25 @@ export class PoolHealthRegistry {
    * `providerRetryAfterMs`.
    */
   earliestRecovery(keys: ReadonlySet<string>, now = Date.now()): number | undefined {
-    let earliest: number | undefined
+    return this.earliestRecoveryRecord(keys, now)?.unavailableUntil
+  }
+
+  /**
+   * The earliest-recovering cooling record among `keys` (with the failure
+   * code that parked it), or `undefined` when none of them is cooling. Lets
+   * an exhausted pool say WHY its members are parked, instead of assuming a
+   * rate limit.
+   */
+  earliestRecoveryRecord(keys: ReadonlySet<string>, now = Date.now()): CoolingRecord | undefined {
+    let earliest: CoolingRecord | undefined
     for (const [key, record] of this.records) {
       if (record.unavailableUntil <= now) {
         this.records.delete(key)
         continue
       }
       if (!keys.has(key)) continue
-      if (earliest === undefined || record.unavailableUntil < earliest) {
-        earliest = record.unavailableUntil
+      if (earliest === undefined || record.unavailableUntil < earliest.unavailableUntil) {
+        earliest = { key, unavailableUntil: record.unavailableUntil, reason: record.reason }
       }
     }
     return earliest

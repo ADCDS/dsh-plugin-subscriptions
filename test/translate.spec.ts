@@ -8,7 +8,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { LlmError, MessageId } from '@deepseek-ai/dsh-llm'
 import { ToolCallId } from '../src/compat.js'
-import type { ContentBlock, Message, MessageSource, StreamChunk } from '@deepseek-ai/dsh-llm'
+import type { CompatibleContentBlock as ContentBlock, CompatibleMessage as Message } from '../src/compat.js'
+import type { MessageSource, StreamChunk } from '@deepseek-ai/dsh-llm'
 import {
   ResponsesStreamTranslator,
   toResponsesInput,
@@ -18,6 +19,7 @@ import type { ReasoningReplayItem, ResponsesStreamEvent } from '../src/translate
 import {
   AnthropicStreamTranslator,
   CLAUDE_CODE_IDENTITY,
+  cacheControl,
   markMessageCache,
   toAnthropicMessages,
   toAnthropicSystem,
@@ -76,6 +78,85 @@ test('toResponsesInput: text, tool call, and tool result round trip', () => {
     { type: 'function_call', call_id: 'call-1', name: 'bash', arguments: '{"cmd":"ls"}' },
     { type: 'function_call_output', call_id: 'call-1', output: 'file-a\nfile-b' },
   ])
+})
+
+test('toResponsesInput: first-class tool-role messages become function outputs', () => {
+  const result: TranslatableMessage = {
+    role: 'tool',
+    toolCallId: 'call-current',
+    content: [{ type: 'text', text: 'current result' }],
+  }
+  const messages: TranslatableMessage[] = [
+    message('assistant', [toolCall('call-current', 'bash', '{}')]),
+    result,
+  ]
+  const { input } = toResponsesInput(messages)
+  assert.deepEqual(input, [
+    { type: 'function_call', call_id: 'call-current', name: 'bash', arguments: '{}' },
+    { type: 'function_call_output', call_id: 'call-current', output: 'current result' },
+  ])
+  assert.deepEqual(toChatMessages(messages)[1], {
+    role: 'tool', tool_call_id: 'call-current', content: 'current result',
+  })
+  assert.deepEqual(toAnthropicMessages(messages)[1], {
+    role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call-current', content: 'current result' }],
+  })
+})
+
+test('first-class parallel tool results preserve Claude error flags and call order', () => {
+  const messages: TranslatableMessage[] = [
+    message('assistant', [toolCall('first', 'bash', '{}'), toolCall('second', 'bash', '{}')]),
+    { role: 'tool', toolCallId: 'first', isError: true, content: [{ type: 'text', text: 'failed' }] },
+    { role: 'tool', toolCallId: 'second', isError: false, content: [{ type: 'text', text: 'done' }] },
+  ]
+  assert.deepEqual(toAnthropicMessages(messages)[1], {
+    role: 'user',
+    content: [
+      { type: 'tool_result', tool_use_id: 'first', content: 'failed', is_error: true },
+      { type: 'tool_result', tool_use_id: 'second', content: 'done' },
+    ],
+  })
+  assert.deepEqual(toChatMessages(messages).slice(1), [
+    { role: 'tool', tool_call_id: 'first', content: 'failed' },
+    { role: 'tool', tool_call_id: 'second', content: 'done' },
+  ])
+})
+
+test('developer messages from DSH 0.1.7 are not attributed to the assistant', () => {
+  const messages: TranslatableMessage[] = [
+    { role: 'developer', content: [{ type: 'text', text: 'Tool inventory changed.' }] },
+  ]
+  assert.equal(toResponsesInput(messages).input[0].role, 'developer')
+  assert.deepEqual(toChatMessages(messages), [{ role: 'developer', content: 'Tool inventory changed.' }])
+  assert.deepEqual(toAnthropicMessages(messages), [{ role: 'user', content: [{ type: 'text', text: 'Tool inventory changed.' }] }])
+})
+
+test('toResponsesInput: first-class tool images follow the function output', () => {
+  const input = toResponsesInput([{
+    role: 'tool',
+    toolCallId: 'call-image',
+    content: [
+      { type: 'text', text: 'caption' },
+      { type: 'image', mediaType: 'image/png', dataBase64: 'aGk=' },
+    ],
+  }]).input
+  assert.deepEqual(input.map(item => item.type), ['function_call_output', 'message'])
+  assert.equal(input[0].output, 'caption')
+  assert.equal((input[1].content as Record<string, unknown>[])[1].type, 'input_image')
+})
+
+test('resolveImages preserves first-class tool call ids', async () => {
+  const ref = { attachmentId: 'image-1', mediaType: 'image/png', bytes: 2, width: 1, height: 1 }
+  const result = {
+    role: 'tool',
+    toolCallId: 'call-image',
+    content: [{ type: 'image', attachment: ref }],
+  } as unknown as Message
+  const resolved = await resolveImages([result], {
+    readImage: async () => ({ ref, data: new Uint8Array([104, 105]) }),
+  } as never)
+  assert.equal(resolved[0].toolCallId, 'call-image')
+  assert.equal(toResponsesInput(resolved).input[0].call_id, 'call-image')
 })
 
 test('toResponsesInput: system-role messages become instructions unless options.system wins', () => {
@@ -567,6 +648,29 @@ test('markMessageCache marks a tool_result block when the turn ends on one', () 
   markMessageCache([{ role: 'user', content }])
   assert.equal(content[0].cache_control, undefined)
   assert.deepEqual(content[1].cache_control, { type: 'ephemeral' })
+})
+
+test('cacheControl spells five minutes by omitting ttl, and one hour explicitly', () => {
+  assert.deepEqual(cacheControl(), { type: 'ephemeral' })
+  assert.deepEqual(cacheControl('5m'), { type: 'ephemeral' })
+  assert.deepEqual(cacheControl('1h'), { type: 'ephemeral', ttl: '1h' })
+  assert.notEqual(cacheControl('1h'), cacheControl('1h'), 'every mark is its own object')
+})
+
+test('markMessageCache and toAnthropicSystem apply one TTL to every mark they place', () => {
+  const content: Record<string, unknown>[] = Array.from(
+    { length: 40 },
+    (_, index) => ({ type: 'text', text: `b${index}` }),
+  )
+  markMessageCache([{ role: 'user', content }], '1h')
+  const marked = content.filter(block => 'cache_control' in block)
+  assert.equal(marked.length, 3)
+  for (const block of marked) assert.deepEqual(block.cache_control, { type: 'ephemeral', ttl: '1h' })
+
+  assert.deepEqual(toAnthropicSystem('explicit', undefined, '1h'), [
+    { type: 'text', text: CLAUDE_CODE_IDENTITY },
+    { type: 'text', text: 'explicit', cache_control: { type: 'ephemeral', ttl: '1h' } },
+  ])
 })
 
 test('toAnthropicTools maps to input_schema tools', () => {

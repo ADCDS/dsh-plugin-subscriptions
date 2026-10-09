@@ -1,10 +1,9 @@
-import { useEffect, useRef, useState } from 'react'
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
 import type { ConnectionHandle } from '@deepseek-ai/dsh-api-remotes/client'
 import type { ProviderPreferences, SubscriptionTool } from '../provider-settings.js'
 import type { SubscriptionProvider } from './SubscriptionsSection.js'
 import { callSubscriptionsAuth } from './subscriptions-rpc.js'
-import { mergeLatestAccounts } from './account-preferences.js'
 import type { SubscriptionsKey } from './locales.js'
 
 interface ModelRow {
@@ -26,19 +25,40 @@ interface Props {
   provider: SubscriptionProvider
   rpc: ConnectionHandle['rpc']
   t: (key: SubscriptionsKey, params?: Record<string, unknown>) => string
-  /** Render the editor as an embedded section of the account manager dialog. */
-  embedded?: boolean
+  /** Freeze the editor while the owning dialog submits. */
+  disabled?: boolean
+  /** Reports whether the draft differs from the loaded catalog. */
+  onDirtyChange?: (dirty: boolean) => void
 }
-const border = '1px solid var(--dsw-alias-border-l2, #ddd)'
-const control: CSSProperties = {
-  font: 'inherit', color: 'inherit', background: 'transparent', border,
-  borderRadius: 8, padding: '6px 10px', minWidth: 0,
+
+/** The editor's unsaved edits, collected by the owning dialog's single Save. */
+export interface ModelDraft {
+  /** Provider settings minus `accounts`; absent when the draft has no edits. */
+  settings?: ProviderPreferences
+  /** Reasoning-effort overrides that differ from the catalog; '' clears one. */
+  efforts: { model: string; effort: string }[]
 }
+export interface ProviderModelEditorHandle {
+  /**
+   * Validate and collect the draft without mutating it, so a failed submit
+   * keeps every edit. Returns undefined when a value is invalid; the editor
+   * shows the reason itself.
+   */
+  collect(): ModelDraft | undefined
+}
+
+const border = '0.5px solid var(--dsw-alias-border-l2, #ddd)'
 const actions: CSSProperties = { display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }
 
-/** Local draft: refreshes and failed saves never silently replace unsaved edits. */
-export function ProviderModelEditor({ provider, rpc, t, embedded = false }: Props) {
-  const [open, setOpen] = useState(embedded === true)
+/**
+ * Embedded section of the account manager dialog. It owns the model draft
+ * (visibility, effort, context, tools) but not its submission: the dialog
+ * collects the draft through the handle and saves it with the account edits
+ * in one go, so there is a single Save/Cancel pair.
+ */
+export const ProviderModelEditor = forwardRef<ProviderModelEditorHandle, Props>(function ProviderModelEditor(
+  { provider, rpc, t, disabled = false, onDirtyChange }, ref,
+) {
   const [catalog, setCatalog] = useState<Catalog>()
   const [draft, setDraft] = useState<ProviderPreferences>({})
   const [contexts, setContexts] = useState<Record<string, string>>({})
@@ -47,9 +67,9 @@ export function ProviderModelEditor({ provider, rpc, t, embedded = false }: Prop
   const [busy, setBusy] = useState(false)
   const [dirty, setDirty] = useState(false)
   const [error, setError] = useState('')
-  const [saved, setSaved] = useState(false)
   const generation = useRef(0)
   useEffect(() => () => { generation.current++ }, [])
+  useEffect(() => { onDirtyChange?.(dirty) }, [dirty])
 
   function reset(data: Catalog) {
     setCatalog(data)
@@ -71,74 +91,57 @@ export function ProviderModelEditor({ provider, rpc, t, embedded = false }: Prop
       if (generation.current === request) setBusy(false)
     }
   }
-  function edit(next: ProviderPreferences) { setDraft(next); setDirty(true); setSaved(false) }
-  useEffect(() => {
-    if (embedded && !catalog && !busy) void load()
-  }, [embedded])
-  async function save() {
-    const windows: Record<string, number> = Object.create(null) as Record<string, number>
-    for (const [model, text] of Object.entries(contexts)) {
-      if (!text.trim()) continue
-      const value = Number(text)
-      if (!/^\d+$/.test(text.trim()) || !Number.isSafeInteger(value) || value <= 0) {
-        setError(t('modelsContextInvalid', { model })); return
+  function edit(next: ProviderPreferences) { setDraft(next); setDirty(true) }
+  useEffect(() => { void load() }, [provider, rpc])
+
+  useImperativeHandle(ref, () => ({
+    collect() {
+      if (!catalog || !dirty) return { efforts: [] }
+      const windows: Record<string, number> = Object.create(null) as Record<string, number>
+      for (const [model, text] of Object.entries(contexts)) {
+        if (!text.trim()) continue
+        const value = Number(text)
+        if (!/^\d+$/.test(text.trim()) || !Number.isSafeInteger(value) || value <= 0) {
+          setError(t('modelsContextInvalid', { model }))
+          return undefined
+        }
+        windows[model] = value
       }
-      windows[model] = value
-    }
-    let settings = { ...draft, ...(provider === 'codex' ? { contextWindows: windows } : {}) }
-    const request = ++generation.current
-    setBusy(true)
-    setError('')
-    let savedEfforts = 0
-    try {
-      for (const model of catalog?.models ?? []) {
-        const effort = efforts[model.id] ?? ''
-        if (effort === (model.configured ?? '') || !model.efforts?.length) continue
-        await callSubscriptionsAuth(rpc, 'setModelDefault', { provider, model: model.id, ...(effort ? { effort } : {}) })
-        savedEfforts++
-        if (generation.current === request) setCatalog(current => current && ({
-          ...current, models: current.models.map(row => {
-            if (row.id !== model.id) return row
-            const { configured: _previous, ...rest } = row
-            return { ...rest, ...(effort ? { configured: effort } : {}) }
-          }),
-        }))
+      setError('')
+      const { accounts: _accounts, ...settings } = { ...draft, ...(provider === 'codex' ? { contextWindows: windows } : {}) }
+      return {
+        settings,
+        efforts: catalog.models.flatMap(model => {
+          const effort = efforts[model.id] ?? ''
+          return effort === (model.configured ?? '') || !model.efforts?.length ? [] : [{ model: model.id, effort }]
+        }),
       }
-      // Account management can save while this editor has an older draft.
-      // Refresh immediately before replacing settings, never revive stale accounts.
-      const latest = await callSubscriptionsAuth<Catalog>(rpc, 'providerSettings', { provider })
-      settings = mergeLatestAccounts(settings, latest.settings)
-      await callSubscriptionsAuth(rpc, 'setProviderSettings', { provider, settings })
-      if (generation.current !== request) return
-      setDraft(settings)
-      setCatalog(current => current && ({ ...current, settings }))
-      setDirty(false)
-      setSaved(true)
-    } catch (error) {
-      if (generation.current === request) setError((savedEfforts ? t('modelsPartialSave') + ' ' : '') + String(error instanceof Error ? error.message : error))
-    } finally {
-      if (generation.current === request) setBusy(false)
-    }
-  }
+    },
+  }), [catalog, dirty, draft, contexts, efforts, provider])
+
   const allModels = catalog?.models ?? []
   const known = new Set(allModels.map(model => model.id))
-  const missing = (draft.visibleModels ?? []).filter(id => !known.has(id)).map(id => ({ id, name: id } as ModelRow))
-  const models = [...allModels, ...missing].filter(model => `${model.name} ${model.id}`.toLowerCase().includes(query.trim().toLowerCase()))
+  const savedIds = new Set([...(draft.visibleModels ?? []), ...Object.keys(draft.modelDisplayNames ?? {})])
+  const missing = [...savedIds].filter(id => !known.has(id)).map(id => ({ id, name: id } as ModelRow))
+  const customName = (id: string) => Object.hasOwn(draft.modelDisplayNames ?? {}, id) ? draft.modelDisplayNames![id] : ''
+  const editName = (id: string, value: string) => {
+    const names: Record<string, string> = Object.assign(Object.create(null), draft.modelDisplayNames)
+    if (value.trim()) names[id] = value
+    else delete names[id]
+    edit({ ...draft, modelDisplayNames: names })
+  }
+  const models = [...allModels, ...missing].filter(model => `${model.name} ${model.id} ${customName(model.id)}`.toLowerCase().includes(query.trim().toLowerCase()))
   const selected = new Set(draft.visibleModels ?? allModels.map(model => model.id))
   return <div style={{ borderTop: border, marginTop: 12, paddingTop: 12 }}>
-    {embedded ? <h3 style={{ margin: 0, fontSize: 15 }}>{t('modelsEdit')}</h3> : <button type="button" style={{ ...control, border: 0, padding: 0, cursor: 'pointer' }} aria-expanded={open}
-      onClick={() => { setOpen(!open); if (!open && !busy && !dirty) void load() }}>
-      {t('modelsEdit')} {open ? '▴' : '▾'}
-    </button>}
-    {open && <div style={{ display: 'grid', gap: 12, marginTop: 12 }}>
-      <p style={{ margin: 0 }}>{t('modelsHint')}</p>
-      {error && <p role="alert" style={{ margin: 0, color: 'var(--dsw-alias-state-error-primary, #b42318)' }}>{error}</p>}
-      {saved && <p role="status" style={{ margin: 0 }}>{t('modelsSaved')}</p>}
+    <h3 style={{ margin: 0 }}>{t('modelsEdit')}</h3>
+    <div style={{ display: 'grid', gap: 12, marginTop: 12 }}>
+      <p className="dsh-subscription-hint">{t('modelsHint')}</p>
+      {error && <p role="alert">{error}</p>}
       <div style={actions}>
-        <button type="button" style={control} disabled={busy || dirty} onClick={() => { void load(true) }}>{t('usageRefresh')}</button>
+        <button type="button" className="dsh-subscription-quiet" disabled={busy || disabled || dirty} onClick={() => { void load(true) }}>{t('usageRefresh')}</button>
         {busy && <span role="status">{t('modelDefaultsLoading')}</span>}
       </div>
-      {catalog && <fieldset disabled={busy} style={{ border: 0, padding: 0, margin: 0, minWidth: 0, display: 'grid', gap: 12 }}>
+      {catalog && <fieldset disabled={busy || disabled} style={{ border: 0, padding: 0, margin: 0, minWidth: 0, display: 'grid', gap: 12 }}>
         <label><input type="checkbox" checked={draft.visibleModels === undefined} onChange={event => {
           const next = { ...draft }
           if (event.target.checked) delete next.visibleModels
@@ -146,10 +149,10 @@ export function ProviderModelEditor({ provider, rpc, t, embedded = false }: Prop
           edit(next)
         }} /> {t('modelsAutomatic')}</label>
         <div style={actions}>
-          <input style={{ ...control, flex: '1 1 180px' }} value={query} onChange={event => setQuery(event.target.value)}
+          <input style={{ flex: '1 1 180px' }} value={query} onChange={event => setQuery(event.target.value)}
             placeholder={t('modelDefaultsFilterPlaceholder')} aria-label={t('modelDefaultsFilterPlaceholder')} />
-          <button type="button" style={control} onClick={() => edit({ ...draft, visibleModels: allModels.map(model => model.id) })}>{t('modelsSelectAll')}</button>
-          <button type="button" style={control} onClick={() => edit({ ...draft, visibleModels: [] })}>{t('modelsSelectNone')}</button>
+          <button type="button" onClick={() => edit({ ...draft, visibleModels: allModels.map(model => model.id) })}>{t('modelsSelectAll')}</button>
+          <button type="button" onClick={() => edit({ ...draft, visibleModels: [] })}>{t('modelsSelectNone')}</button>
         </div>
         <div style={{ maxHeight: 360, overflowY: 'auto', display: 'grid', gap: 8 }}>
           {models.map(model => <div key={model.id} style={{ borderBottom: border, padding: '8px 2px', display: 'grid', gap: 8 }}>
@@ -158,11 +161,24 @@ export function ProviderModelEditor({ provider, rpc, t, embedded = false }: Prop
               if (event.target.checked) next.add(model.id); else next.delete(model.id)
               edit({ ...draft, visibleModels: [...next] })
             }} /> {model.name}{!known.has(model.id) && ` (${t('modelsUnavailable')})`}</label>
+            <small style={{ color: 'var(--dsw-alias-label-tertiary)', overflowWrap: 'anywhere' }}>ID: {model.id}</small>
+            <div style={actions}>
+              <label style={{ display: 'grid', gap: 6, flex: '1 1 200px', minWidth: 0 }}>
+                <span style={{ fontSize: 12 }}>{t('modelDisplayName')}</span>
+                <input maxLength={80} aria-label={`${model.name} ${t('modelDisplayName')}`}
+                  placeholder={model.name} value={customName(model.id)}
+                  onChange={event => editName(model.id, event.target.value)} />
+              </label>
+              <button type="button" style={{ alignSelf: 'end' }}
+                aria-label={`${model.name} ${t('displayNameReset')}`} disabled={!customName(model.id)}
+                onClick={() => editName(model.id, '')}>{t('displayNameReset')}</button>
+            </div>
+            <small style={{ color: 'var(--dsw-alias-label-tertiary)' }}>{t('modelDisplayNameHint')}</small>
             <div style={actions}>
             {(model.efforts?.length ?? 0) > 0 && <label style={actions}>{t('modelDefaultsTitle')}
-              <select style={control} aria-label={`${model.name} ${t('modelDefaultsTitle')}`}
+              <select aria-label={`${model.name} ${t('modelDefaultsTitle')}`}
                 value={efforts[model.id] ?? ''} onChange={event => {
-                  setEfforts({ ...efforts, [model.id]: event.target.value }); setDirty(true); setSaved(false)
+                  setEfforts({ ...efforts, [model.id]: event.target.value }); setDirty(true)
                 }}>
                 <option value="">{t('modelDefaultsFollowProvider')}</option>
                 {model.configured && !model.efforts?.some(effort => effort.id === model.configured) &&
@@ -172,9 +188,9 @@ export function ProviderModelEditor({ provider, rpc, t, embedded = false }: Prop
             </label>}
             {provider === 'codex' && model.maxContextWindow !== undefined && <div style={actions}>
               <label style={actions}>{t('modelsContext')}
-                <input style={{ ...control, width: 140 }} inputMode="numeric" value={contexts[model.id] ?? ''}
+                <input style={{ width: 140 }} inputMode="numeric" value={contexts[model.id] ?? ''}
                   aria-label={`${model.name} ${t('modelsContext')}`} placeholder={String(model.defaultContextWindow)}
-                  onChange={event => { setContexts({ ...contexts, [model.id]: event.target.value }); setDirty(true); setSaved(false) }} />
+                  onChange={event => { setContexts({ ...contexts, [model.id]: event.target.value }); setDirty(true) }} />
               </label>
               <small>{t('modelsContextBounds', { default: model.defaultContextWindow, max: model.maxContextWindow })}</small>
             </div>}
@@ -192,11 +208,7 @@ export function ProviderModelEditor({ provider, rpc, t, embedded = false }: Prop
             })} /> {t(tool === 'image_generate' ? 'modelsImage' : tool === 'video_generate' ? 'modelsVideo' : tool === 'web_search' ? 'modelsWebSearch' : 'modelsSearch')}
           </label>)}
         </div>}
-        <div style={actions}>
-          <button type="button" style={control} disabled={!dirty} onClick={() => { void save() }}>{t('modelsSave')}</button>
-          <button type="button" style={control} disabled={!dirty} onClick={() => { reset(catalog); setError(''); setSaved(false) }}>{t('cancel')}</button>
-        </div>
       </fieldset>}
-    </div>}
+    </div>
   </div>
-}
+})

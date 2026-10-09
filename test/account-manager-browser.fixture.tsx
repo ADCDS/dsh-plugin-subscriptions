@@ -7,6 +7,7 @@ const state = window as any
 state.settings = { visibleModels: ['alpha'], accounts: {} }
 state.failSave = false
 state.saved = []
+state.efforts = []
 const rpc = { call: async (_channel: string, endpoint: string, payload: any) => {
   if (endpoint.endsWith('.setProviderSettings')) {
     if (state.failSave) return { ok: false, error: { message: 'Simulated save failure' } }
@@ -14,7 +15,11 @@ const rpc = { call: async (_channel: string, endpoint: string, payload: any) => 
     state.saved.push(payload.settings)
     return { ok: true, value: {} }
   }
-  return { ok: true, value: { settings: structuredClone(state.settings), accounts: [
+  if (endpoint.endsWith('.setModelDefault')) { state.efforts.push(payload); return { ok: true, value: {} } }
+  return { ok: true, value: { settings: structuredClone(state.settings), tools: ['image_generate'], models: [
+    { id: 'alpha', name: 'Alpha', efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }], defaultContextWindow: 272000, maxContextWindow: 872000 },
+    { id: 'beta', name: 'Beta' },
+  ], accounts: [
     { key: 'personal', label: 'personal@example.com', models: state.preview ? [{ id: 'gpt-5.4', name: 'GPT-5.4' }, { id: 'gpt-5.1-codex', name: 'GPT-5.1 Codex' }] : [{ id: 'alpha', name: 'Alpha' }, { id: 'beta', name: 'Beta' }] },
     { key: 'work', label: 'work@example.com', models: state.preview ? [{ id: 'gpt-5.4', name: 'GPT-5.4' }, { id: 'gpt-5.1-codex', name: 'GPT-5.1 Codex' }] : [], unavailable: !state.preview },
   ] } }

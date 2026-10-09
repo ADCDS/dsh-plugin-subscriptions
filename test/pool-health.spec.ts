@@ -12,6 +12,8 @@ import { LlmError } from '@deepseek-ai/dsh-llm'
 import {
   accountKey,
   AUTH_COOLDOWN_MS,
+  CODEX_BURST_COOLDOWN_MS,
+  CODEX_TRANSIENT_COOLDOWN_MS,
   classifyPoolFailure,
   DEFAULT_QUOTA_COOLDOWN_MS,
   memberKey,
@@ -34,11 +36,40 @@ test('classifyPoolFailure: quota and rate-limit cool the whole account (account-
   })
 })
 
+test('classifyPoolFailure: bare Codex 429 gets a short burst cooldown, but disclosed resets win', () => {
+  assert.deepEqual(classifyPoolFailure(new LlmError('burst', 'RATE_LIMIT', { status: 429 }), 'codex'), {
+    action: 'switch', cooldownMs: CODEX_BURST_COOLDOWN_MS, reason: 'CODEX_BURST_429', scope: 'account',
+  })
+  assert.deepEqual(classifyPoolFailure(new LlmError('window', 'RATE_LIMIT', { status: 429, providerRetryAfterMs: 6_000_000 }), 'codex'), {
+    action: 'switch', cooldownMs: 6_000_000, reason: 'RATE_LIMIT', scope: 'account',
+  })
+  assert.deepEqual(classifyPoolFailure(new LlmError('quota', 'QUOTA'), 'codex'), {
+    action: 'switch', cooldownMs: DEFAULT_QUOTA_COOLDOWN_MS, reason: 'QUOTA', scope: 'account',
+  })
+})
+
+test('classifyPoolFailure: Codex server failures retry after a short member cooldown', () => {
+  assert.deepEqual(classifyPoolFailure(new LlmError('overloaded', 'SERVER', { status: 503 }), 'codex'), {
+    action: 'switch', cooldownMs: CODEX_TRANSIENT_COOLDOWN_MS, reason: 'SERVER', scope: 'member',
+  })
+})
+
 test('classifyPoolFailure: claude quota failures stay member-scoped (per-model lanes)', () => {
   assert.deepEqual(classifyPoolFailure(new LlmError('quota', 'QUOTA'), 'claude'), {
     action: 'switch',
     cooldownMs: DEFAULT_QUOTA_COOLDOWN_MS,
     reason: 'QUOTA',
+    scope: 'member',
+  })
+})
+
+test('classifyPoolFailure: an Antigravity quota parks only the exhausted model', () => {
+  // One model's 35-hour quota reset must not park the account's other models.
+  const error = new LlmError('quota', 'RATE_LIMIT', { providerRetryAfterMs: 35 * 3_600_000 })
+  assert.deepEqual(classifyPoolFailure(error, 'antigravity'), {
+    action: 'switch',
+    cooldownMs: 35 * 3_600_000,
+    reason: 'RATE_LIMIT',
     scope: 'member',
   })
 })
@@ -66,7 +97,7 @@ test('classifyPoolFailure: auth failures park the account until re-login', () =>
 
 test('classifyPoolFailure: transient server failures cool the member briefly', () => {
   for (const code of ['SERVER', 'TIMEOUT', 'EMPTY_RESPONSE']) {
-    assert.deepEqual(classifyPoolFailure(new LlmError('oops', code), 'codex'), {
+    assert.deepEqual(classifyPoolFailure(new LlmError('oops', code), 'claude'), {
       action: 'switch',
       cooldownMs: TRANSIENT_COOLDOWN_MS,
       reason: code,
@@ -145,6 +176,20 @@ test('PoolHealthRegistry: earliestRecovery ignores records outside the given key
   const keys = new Set([memberKey('codex', 'a1', 'a'), accountKey('codex', 'a1')])
   // The unrelated pool's sooner recovery must not shape this pool's hint.
   assert.equal(registry.earliestRecovery(keys, 0), 9000)
+})
+
+test('PoolHealthRegistry: earliestRecoveryRecord names the key and the reason that parked it', () => {
+  const registry = new PoolHealthRegistry()
+  const keys = new Set([memberKey('codex', 'a1', 'a'), accountKey('codex', 'a2')])
+  assert.equal(registry.earliestRecoveryRecord(keys, 0), undefined)
+  registry.markUnavailable(memberKey('codex', 'a1', 'a'), 9000, 'SERVER', 0)
+  registry.markUnavailable(accountKey('codex', 'a2'), 3000, 'AUTH', 0)
+  assert.deepEqual(registry.earliestRecoveryRecord(keys, 0), {
+    key: accountKey('codex', 'a2'), unavailableUntil: 3000, reason: 'AUTH',
+  })
+  assert.deepEqual(registry.earliestRecoveryRecord(keys, 5000), {
+    key: memberKey('codex', 'a1', 'a'), unavailableUntil: 9000, reason: 'SERVER',
+  })
 })
 
 test('PoolHealthRegistry: clear drops one account, or the whole provider when no account is given', () => {

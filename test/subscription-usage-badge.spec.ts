@@ -1,3 +1,4 @@
+import { PartialArguments } from '@deepseek-ai/dsh-util-values'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createElement } from 'react'
@@ -11,11 +12,21 @@ const css = registerHooks({ load(url, context, nextLoad) {
     : nextLoad(url, context)
 } })
 const { AccountWindows, compactSegment, createCurrentModelReader, previewWindows,
-  collapsedDisplays, expandedDisplays } = await import('../src/client/SubscriptionUsageBadge.js')
+  collapsedDisplays, expandedDisplays, retainSubscriptionSelection, usageBadgeIcon } = await import('../src/client/SubscriptionUsageBadge.js')
+const { ImageGenerateToolview } = await import('../src/client/ImageGenerateToolview.js')
+const { VideoGenerateToolview } = await import('../src/client/VideoGenerateToolview.js')
 css.deregister()
 import type { ProviderUsageDisplay } from '../src/client/SubscriptionUsageBadge.js'
 import type { UsageWindow } from '../src/client/SubscriptionsSection.js'
 import { en, zh } from '../src/client/locales.js'
+
+test('media tool views render the preparing phase before arguments are available', () => {
+  for (const [Component, name] of [[ImageGenerateToolview, 'image_generate'], [VideoGenerateToolview, 'video_generate']] as const) {
+    const block = { phase: 'preparing' as const, args: PartialArguments.EMPTY, callId: 'media-call', name, turn: 0, step: 0, time: 0, subCalls: [] }
+    const html = renderToStaticMarkup(createElement(Component, { block }))
+    assert.ok(html.includes(name))
+  }
+})
 
 const windows: UsageWindow[] = Array.from({ length: 60 }, (_, i) => ({
   kind: 'other', scope: `gemini-model-${i}`, usedPercent: i,
@@ -71,7 +82,63 @@ test('provider ordering stays independent from model-window filtering', () => {
   const all = [display('codex'), display()]
   assert.deepEqual(collapsedDisplays(all, 'antigravity'), [all[1]])
   assert.deepEqual(expandedDisplays(all, 'antigravity'), [all[1], all[0]])
-  assert.deepEqual(collapsedDisplays(all, undefined), all)
+  assert.deepEqual(collapsedDisplays(all, undefined), [])
+  assert.deepEqual(collapsedDisplays(all, 'deepseek'), [])
+  assert.deepEqual(collapsedDisplays(all, 'grok'), [])
+})
+
+test('non-subscription selections retain only the last subscription and its model scope', () => {
+  const codex = { provider: 'codex', model: 'gpt-test' }
+  const anti = { provider: 'antigravity', model: 'gemini-model-59' }
+  const api = { provider: 'deepseek', model: 'deepseek-chat' }
+  assert.equal(retainSubscriptionSelection(undefined, api), undefined)
+  assert.equal(retainSubscriptionSelection(undefined, undefined), undefined)
+  assert.equal(retainSubscriptionSelection(undefined, codex), codex)
+  assert.equal(retainSubscriptionSelection(codex, api), codex)
+  assert.equal(retainSubscriptionSelection(codex, anti), anti)
+  assert.equal(retainSubscriptionSelection(anti, api), anti)
+  assert.equal(retainSubscriptionSelection(anti, undefined), anti)
+  assert.deepEqual(collapsedDisplays([display('codex'), display()], retainSubscriptionSelection(anti, api)?.provider).map(d => d.provider), ['antigravity'])
+  assert.deepEqual(collapsedDisplays([display('codex')], anti.provider), [])
+})
+
+test('data icon supports both DSH export names without requiring either named import', () => {
+  const modern = () => createElement('svg', { 'data-version': 'modern' })
+  const legacy = () => createElement('svg', { 'data-version': 'legacy' })
+  assert.equal(usageBadgeIcon({ IconDataOutlineRegular: modern, IconDataOutline16: legacy }), modern)
+  assert.equal(usageBadgeIcon({ IconDataOutlineRegular: modern }), modern)
+  assert.equal(usageBadgeIcon({ IconDataOutline16: legacy }), legacy)
+  assert.match(renderToStaticMarkup(createElement(usageBadgeIcon({ IconDataOutlineRegular: modern }))), /data-version="modern"/)
+  assert.equal(renderToStaticMarkup(createElement(usageBadgeIcon({}))), '')
+})
+
+test('Antigravity previews only the exact current model, retaining all hidden windows', () => {
+  const original = structuredClone(windows)
+  assert.deepEqual(previewWindows(windows, undefined, 'antigravity'), { shown: [], hidden: windows })
+  assert.deepEqual(previewWindows(windows, 'missing', 'antigravity'), { shown: [], hidden: windows })
+  const current = previewWindows(windows, 'gemini-model-59', 'antigravity')
+  assert.equal(current.shown.length, 1)
+  assert.equal(current.shown[0]?.scope, 'gemini-model-59')
+  assert.equal(current.hidden.length, 59)
+  const multiple: UsageWindow[] = [...windows,
+    { kind: 'weekly', scope: 'gemini-model-59', usedPercent: 81 },
+    { kind: 'session', scope: 'gemini-model-59', usedPercent: 25 }]
+  const bounded = previewWindows(multiple, 'gemini-model-59', 'antigravity')
+  assert.deepEqual(bounded.shown.map(w => w.usedPercent), [59, 81])
+  assert.equal(new Set([...bounded.shown, ...bounded.hidden]).size, multiple.length)
+  assert.deepEqual(windows, original)
+  for (const provider of ['codex', 'grok', 'claude'] as const) {
+    assert.equal(previewWindows(windows, undefined, provider).shown.length, 4)
+  }
+})
+
+test('inactive Antigravity renders every model inside a closed disclosure', () => {
+  const translate = (key: keyof typeof en, params?: Record<string, unknown>) =>
+    en[key].replace(/\{(\w+)\}/g, (_, name: string) => String(params?.[name] ?? ''))
+  const html = renderToStaticMarkup(createElement(AccountWindows, { windows, model: undefined, provider: 'antigravity', translate }))
+  assert.ok(html.indexOf('<details') < html.indexOf('gemini-model-0'))
+  assert.ok(html.includes(translate('usageBadgeMoreWindows', { count: 60 })))
+  assert.ok(!html.includes('open=""'))
 })
 
 test('model reader observes switches within the same provider and handles missing directories', async () => {

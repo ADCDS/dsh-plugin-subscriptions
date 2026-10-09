@@ -9,14 +9,16 @@
  * design-platform.css values flip under `body[data-ds-dark-theme]`), and
  * every user-visible string goes through the locale-bound `t` of the
  * 'settings.subscriptions' namespace. Buttons and inputs take the
- * ModelsSection vocabulary minus hover rules, which inline styles cannot
- * express.
+ * native settings vocabulary with shared, scoped control states.
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
 import type { ConnectionHandle } from '@deepseek-ai/dsh-api-remotes/client'
 import { en } from './locales.js'
+import { resetActionBlock } from './reset-action.js'
 import { ProviderAccountManager } from './ProviderAccountManager.js'
+import { providerSettingsCss } from './provider-settings-styles.js'
+import { UsageBadgeDisplaySetting } from './UsageBadgeDisplaySetting.js'
 import type { SubscriptionsKey } from './locales.js'
 
 import { callSubscriptionsAuth, SubscriptionsAuthError } from './subscriptions-rpc.js'
@@ -45,9 +47,21 @@ export interface AccountStatus {
 
 /** One provider's login state as answered by the `status` endpoint. */
 export interface ProviderStatus {
+  displayName?: string
   busy: boolean
   accounts: AccountStatus[]
   detail?: string
+  /** The CLI version the route presents (Codex, Claude), and where it came from. */
+  clientVersion?: { version: string; source: ClientVersionSource }
+}
+
+export type ClientVersionSource = 'npm' | 'local' | 'fallback' | 'config'
+
+const CLIENT_VERSION_SOURCES: Record<ClientVersionSource, SubscriptionsKey> = {
+  npm: 'clientVersionNpm',
+  local: 'clientVersionLocal',
+  fallback: 'clientVersionFallback',
+  config: 'clientVersionConfig',
 }
 
 /** `status` endpoint value: the node half owns this shape. */
@@ -68,6 +82,8 @@ export interface ProviderUsage {
   supported: boolean
   windows?: UsageWindow[]
   plan?: string
+  resetCredits?: { id?: string; grantedAt?: number; expiresAt?: number }[]
+  resetCreditsError?: string
 }
 
 /** One model's default-effort picker state as answered by `modelDefaults`. */
@@ -171,40 +187,29 @@ const styles: Record<string, CSSProperties> = {
   },
   intro: { margin: 0, color: 'var(--dsw-alias-label-tertiary)', fontSize: 14, lineHeight: '22px' },
   card: {
-    border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 12,
+    border: '0.5px solid var(--dsw-alias-settings-card-stroke, var(--dsw-alias-border-l4))',
+    borderRadius: 'var(--dsw-radius-xl, 20px)', background: 'var(--dsw-alias-settings-card-fill, var(--dsw-alias-bg-layer-2))',
     padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: 6,
   },
   proxyCard: {
     padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: 6,
   },
-  separator: { borderTop: '1px solid var(--dsw-alias-border-l2)' },
+  separator: { borderTop: '0.5px solid var(--dsw-alias-border-l2)' },
   cardHeader: { display: 'flex', alignItems: 'center', gap: 8 },
   dot: { width: 8, height: 8, borderRadius: '50%', flexShrink: 0 },
   name: { fontWeight: 500, fontSize: 14, lineHeight: '22px', color: 'var(--dsw-alias-label-primary)' },
   statusLine: { margin: 0, fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-tertiary)' },
+  clientVersion: { fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-tertiary)', fontVariantNumeric: 'tabular-nums' },
   errorLine: { margin: 0, fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-state-error-primary)' },
   actions: { display: 'flex', gap: 8, marginTop: 4, alignItems: 'center', flexWrap: 'wrap' },
-  button: {
-    boxSizing: 'border-box', display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-    height: 28, padding: '0 10px', borderRadius: 14,
-    border: '1px solid var(--dsw-alias-border-l2)', background: 'transparent',
-    color: 'var(--dsw-alias-label-primary)', font: 'inherit', fontSize: 12, lineHeight: '18px',
-    cursor: 'pointer',
-  },
   usage: {
     display: 'flex', flexDirection: 'column', gap: 6, marginTop: 4,
-    borderTop: '1px solid var(--dsw-alias-border-l2)', paddingTop: 8,
+    borderTop: '0.5px solid var(--dsw-alias-border-l2)', paddingTop: 8,
   },
   usageHeader: { display: 'flex', alignItems: 'center', gap: 8 },
   usageTitle: { fontSize: 12, lineHeight: '18px', fontWeight: 500, color: 'var(--dsw-alias-label-secondary)' },
   usagePlan: { fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-tertiary)' },
-  usageRefresh: {
-    boxSizing: 'border-box', display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-    height: 22, padding: '0 8px', borderRadius: 11, marginLeft: 'auto',
-    border: '1px solid var(--dsw-alias-border-l2)', background: 'transparent',
-    color: 'var(--dsw-alias-label-secondary)', font: 'inherit', fontSize: 12, lineHeight: '18px',
-    cursor: 'pointer',
-  },
+  usageRefresh: { minHeight: 22, height: 22, padding: '0 8px', marginLeft: 'auto' },
   usageRow: { display: 'flex', flexDirection: 'column', gap: 3 },
   usageMeta: {
     display: 'flex', justifyContent: 'space-between', gap: 8,
@@ -212,24 +217,24 @@ const styles: Record<string, CSSProperties> = {
   },
   accountRow: {
     display: 'flex', flexDirection: 'column', gap: 6,
-    border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 8,
+    border: '0.5px solid var(--dsw-alias-border-l2)', borderRadius: 'var(--dsw-radius-lg, 16px)',
     padding: '8px 10px', marginTop: 4,
   },
   accountHeader: { display: 'flex', alignItems: 'center', gap: 8 },
   accountName: { fontSize: 13, lineHeight: '20px', color: 'var(--dsw-alias-label-primary)', userSelect: 'all' },
   starButton: {
-    border: 'none', background: 'transparent', padding: 0,
+    border: 'none', padding: 0, width: 28,
     font: 'inherit', fontSize: 14, lineHeight: '20px', cursor: 'pointer',
     color: 'var(--dsw-alias-state-warn-label)',
   },
   usageTrack: {
     height: 6, borderRadius: 3, overflow: 'hidden',
-    background: 'var(--dsw-alias-bg-layer-1)', border: '1px solid var(--dsw-alias-border-l2)',
+    background: 'var(--dsw-alias-bg-layer-1)', border: '0.5px solid var(--dsw-alias-border-l2)',
   },
   usageFill: { height: '100%', borderRadius: 3 },
   deviceCode: {
     marginTop: 4, display: 'flex', flexDirection: 'column', gap: 6,
-    border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 8,
+    border: '0.5px solid var(--dsw-alias-border-l2)', borderRadius: 'var(--dsw-radius-lg, 16px)',
     padding: '10px 12px', background: 'var(--dsw-alias-bg-layer-1)',
   },
   deviceCodeText: {
@@ -237,13 +242,11 @@ const styles: Record<string, CSSProperties> = {
     color: 'var(--dsw-alias-label-primary)', userSelect: 'all',
   },
   proxyField: { display: 'flex', flexDirection: 'column', gap: 4 },
-  proxyLabel: { fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-secondary)' },
-  proxyInput: {
-    height: 32, width: '100%', boxSizing: 'border-box',
-    border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 8,
-    padding: '0 10px', font: 'inherit', fontSize: 14, lineHeight: '22px',
-    background: 'var(--dsw-alias-bg-layer-1)', color: 'var(--dsw-alias-label-primary)',
-  },
+  proxyLabel: { fontSize: 13, fontWeight: 500, lineHeight: '20px', color: 'var(--dsw-alias-label-primary)' },
+  proxyInput: { width: '100%' },
+  manual: { fontSize: 13, lineHeight: '20px' },
+  manualRow: { display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center', marginTop: 8 },
+  manualInput: { flex: '1 1 200px', minWidth: 0 },
   proxyHint: {
     margin: 0, fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-tertiary)',
   },
@@ -256,16 +259,16 @@ const styles: Record<string, CSSProperties> = {
   modalOverlay: {
     position: 'fixed', inset: 0, zIndex: 1000,
     display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16,
-    background: 'rgba(0, 0, 0, 0.45)',
+    background: 'var(--dsw-alias-bg-mask-1, #0006)', backdropFilter: 'var(--dsw-mask-blur, none)',
   },
   modal: {
     width: 460, maxWidth: '100%', maxHeight: '90vh', overflowY: 'auto',
     boxSizing: 'border-box', display: 'flex', flexDirection: 'column', gap: 12,
-    padding: '16px 18px', borderRadius: 12,
-    background: 'var(--dsw-alias-bg-layer-1)', border: '1px solid var(--dsw-alias-border-l2)',
+    padding: '16px 18px', borderRadius: 'var(--dsw-radius-panel, 28px)',
+    background: 'var(--dsw-alias-bg-layer-2)', border: 0, boxShadow: 'var(--dsw-elevation-prominent)',
   },
   modalHeader: { display: 'flex', alignItems: 'center', gap: 8 },
-  modalTitle: { fontWeight: 600, fontSize: 15, lineHeight: '22px', color: 'var(--dsw-alias-label-primary)' },
+  modalTitle: { fontWeight: 500, fontSize: 16, lineHeight: '24px', color: 'var(--dsw-alias-label-primary)' },
 }
 
 /** Status dot color for one provider state. */
@@ -284,6 +287,19 @@ function dotColor(status: ProviderStatus | undefined): string {
  */
 function hasAccount(status: ProviderStatus | undefined): boolean {
   return (status?.accounts.length ?? 0) > 0
+}
+
+/** The CLI version a route presents, beside the provider name; nothing for routes without one. */
+export function ClientVersionTag({ clientVersion, t }: {
+  clientVersion: ProviderStatus['clientVersion']
+  t: SubscriptionsSectionInjected['t']
+}) {
+  if (clientVersion === undefined) return null
+  return (
+    <span style={styles.clientVersion} title={t('clientVersionHint')}>
+      {t('clientVersion', { version: clientVersion.version, source: t(CLIENT_VERSION_SOURCES[clientVersion.source]) })}
+    </span>
+  )
 }
 
 /**
@@ -451,6 +467,17 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
   const [usages, setUsages] = useState<Record<string, ProviderUsage>>({})
   const [usageErrors, setUsageErrors] = useState<Record<string, string>>({})
   const [usageLoading, setUsageLoading] = useState<Record<string, boolean>>({})
+  const [resetConfirmation, setResetConfirmation] = useState<{ account: string; ticket: string; expiresAt: number; creditExpiresAt?: number; weeklyUsedPercent: number }>()
+  const [resetBusy, setResetBusy] = useState(false)
+  const [resetAcknowledged, setResetAcknowledged] = useState(false)
+  const [resetMessage, setResetMessage] = useState('')
+  const [resetAccount, setResetAccount] = useState<string>()
+  const resetDialogRef = useRef<HTMLDialogElement>(null)
+  useEffect(() => {
+    if (resetConfirmation) resetDialogRef.current?.showModal()
+    else resetDialogRef.current?.close()
+  }, [resetConfirmation])
+  const resetInflight = useRef(false)
   const mountedRef = useRef(true)
   const pollersRef = useRef(new Map<SubscriptionProvider, ReturnType<typeof setInterval>>())
   /** Accounts with a `usage` call in flight; guards the auto-fetch effect against re-entry. */
@@ -568,6 +595,37 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
       if (mountedRef.current) setUsageLoading(prev => ({ ...prev, [key]: false }))
     }
   }, [rpc])
+
+  async function prepareReset(account: string): Promise<void> {
+    if (!rpc || resetInflight.current) return
+    resetInflight.current = true
+    setResetBusy(true)
+    setResetAccount(account)
+    setResetConfirmation(undefined)
+    setResetMessage('')
+    try {
+      const result = await callSubscriptionsAuth<Omit<NonNullable<typeof resetConfirmation>, 'account'>>(rpc, 'prepareReset', { account })
+      setResetAcknowledged(false)
+      setResetConfirmation({ ...result, account })
+    } catch (error) { setResetMessage(messageOf(error)) }
+    finally { resetInflight.current = false; setResetBusy(false) }
+  }
+
+  async function consumeReset(): Promise<void> {
+    if (!rpc || !resetConfirmation || !resetAcknowledged || resetInflight.current) return
+    const { account, ticket } = resetConfirmation
+    resetInflight.current = true
+    setResetBusy(true)
+    setResetConfirmation(undefined)
+    try {
+      await callSubscriptionsAuth(rpc, 'consumeReset', { account, ticket })
+      setResetMessage(t('resetUseSuccess'))
+    } catch (error) { setResetMessage(messageOf(error)) }
+    finally {
+      await loadUsage('codex', account, true)
+      resetInflight.current = false; setResetBusy(false)
+    }
+  }
 
   // Fetch usage once an account is logged in; drop the snapshots of accounts
   // that vanished so a re-login refetches. A failed lookup does not auto-retry
@@ -765,8 +823,10 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
   }
 
   return (
-    <div style={styles.section}>
+    <div className="dsh-subscriptions-settings" style={styles.section}>
+      <style>{providerSettingsCss}</style>
       <p style={styles.intro}>{t('intro')}</p>
+      <UsageBadgeDisplaySetting t={t} />
       <div style={styles.proxyCard}>
         <div style={styles.cardHeader}>
           <span style={{
@@ -778,7 +838,7 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
           <span style={styles.name}>{t('proxyTitle')}</span>
           <button
             type="button"
-            style={{ ...styles.button, marginLeft: 'auto', flexShrink: 0 }}
+            style={{ marginLeft: 'auto', flexShrink: 0 }}
             onClick={openProxyDialog}
           >
             {t('proxyConfigure')}
@@ -796,7 +856,9 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
           <div key={id} style={styles.card}>
             <div style={styles.cardHeader}>
               <span style={{ ...styles.dot, background: dotColor(status) }} />
-              <span style={styles.name}>{name}</span>
+              <span style={styles.name}>{status?.displayName || name}</span>
+              {status?.displayName && <small style={styles.statusLine}>{name}</small>}
+              <ClientVersionTag clientVersion={status?.clientVersion} t={t} />
             </div>
             <p style={styles.statusLine}>{statusText(t, status)}</p>
             {status?.detail !== undefined && status.detail !== '' && (
@@ -808,6 +870,10 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
               const usage = usages[usageKey]
               const usageError = usageErrors[usageKey]
               const display = account.account ?? account.key
+              const sortedCredits = [...(usage?.resetCredits ?? [])].sort((a, b) => (a.expiresAt ?? Infinity) - (b.expiresAt ?? Infinity))
+              const nextReset = sortedCredits.find(c => c.expiresAt === undefined || c.expiresAt > Date.now())
+              const resetBlock = usage ? resetActionBlock(usage) : 'resetUseRefresh'
+              const resetDisabled = resetBusy || resetBlock !== undefined
               // Providers without a usage endpoint answer supported:false — no block.
               const showUsage = usage?.supported !== false
                 && (usage !== undefined || usageError !== undefined || usageLoading[usageKey] === true)
@@ -835,7 +901,7 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
                     )}
                     <button
                       type="button"
-                      style={{ ...styles.button, marginLeft: 'auto', flexShrink: 0 }}
+                      style={{ marginLeft: 'auto', flexShrink: 0 }}
                       onClick={() => { void logout(id, account.key, display, name) }}
                     >
                       {t('logout')}
@@ -850,7 +916,7 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
                         )}
                         <button
                           type="button"
-                          style={{ ...styles.usageRefresh, ...usageLoading[usageKey] === true ? { opacity: 0.5, cursor: 'default' } : {} }}
+                          style={styles.usageRefresh}
                           disabled={usageLoading[usageKey] === true}
                           onClick={() => { void loadUsage(id, account.key, true) }}
                         >
@@ -884,6 +950,44 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
                           </div>
                         )
                       })}
+                      {id === 'codex' && usage?.resetCreditsError !== undefined && (
+                        <p style={styles.errorLine}>{t('resetCreditsError', { message: usage.resetCreditsError })}</p>
+                      )}
+                      {id === 'codex' && usage?.resetCredits !== undefined && (
+                        <details className="subscriptions-reset-credits" style={styles.usageRow}>
+                          <summary style={{ ...styles.usageMeta, cursor: 'pointer', listStyle: 'none', justifyContent: 'flex-start', gap: 6 }}>
+                            <svg aria-hidden="true" width="12" height="12" viewBox="0 0 16 16" style={{ flexShrink: 0 }}>
+                              <path d="m6 3 5 5-5 5" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                            </svg>
+                            <span>{t('resetCreditsTitle')}</span>
+                            <span style={{ marginLeft: 'auto' }}>{t('resetCreditsAvailable', { count: usage.resetCredits.length })}</span>
+                          </summary>
+                          <style>{
+                            '.subscriptions-reset-credits > summary::-webkit-details-marker { display: none; }'
+                            + '.subscriptions-reset-credits[open] > summary > svg { transform: rotate(90deg); }'
+                          }</style>
+                          <div style={{ paddingLeft: 18, marginTop: 6 }}>
+                            {sortedCredits.map((credit, index) => (
+                              <div key={credit.id ?? index} style={{ ...styles.usageMeta, minHeight: 28, gap: 12 }}>
+                                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+                                  {t('resetCreditFull')}
+                                  {credit === nextReset && (
+                                    <button type="button" aria-disabled={resetDisabled}
+                                      title={t(resetBusy ? 'resetUseChecking' : resetBlock ?? 'resetUseReady')}
+                                      style={{ height: 22, minHeight: 22, padding: '0 7px',
+                                        opacity: resetDisabled ? 0.35 : 1, cursor: resetDisabled ? 'not-allowed' : 'pointer' }}
+                                      onClick={() => { if (!resetDisabled) void prepareReset(account.key) }}>
+                                      {resetBusy && resetAccount === account.key ? t('resetUseChecking') : t('resetUseButton')}
+                                    </button>
+                                  )}
+                                </span>
+                                <span style={{ textAlign: 'right' }}>{credit.expiresAt === undefined ? t('resetCreditExpiryUnknown') : t('resetCreditExpires', { date: new Date(credit.expiresAt).toLocaleString() })}</span>
+                              </div>
+                            ))}
+                            {resetAccount === account.key && resetMessage && <p role="status" style={styles.statusLine}>{resetMessage}</p>}
+                          </div>
+                        </details>
+                      )}
                     </div>
                   )}
                 </div>
@@ -891,31 +995,31 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
             })}
             <div style={styles.actions}>
               {!busy && accounts.length === 0 && (
-                <button type="button" style={styles.button} onClick={() => { void login(id) }}>
+                <button type="button" onClick={() => { void login(id) }}>
                   {t('login')}
                 </button>
               )}
               {!busy && accounts.length > 0 && id === 'claude' && (
                 <>
-                  <button type="button" style={styles.button} onClick={() => { void login(id, 'oauth') }}>
+                  <button type="button" onClick={() => { void login(id, 'oauth') }}>
                     {t('addAccountOAuth')}
                   </button>
-                  <button type="button" style={styles.button} onClick={() => { void login(id, 'keychain') }}>
+                  <button type="button" onClick={() => { void login(id, 'keychain') }}>
                     {t('addAccountKeychain')}
                   </button>
                 </>
               )}
               {!busy && accounts.length > 0 && id !== 'claude' && (
-                <button type="button" style={styles.button} onClick={() => { void login(id) }}>
+                <button type="button" onClick={() => { void login(id) }}>
                   {t('addAccount')}
                 </button>
               )}
-              <button type="button" style={styles.button} aria-haspopup="dialog"
+              <button type="button" aria-haspopup="dialog"
                 onClick={() => setManagedProvider({ id, name })}>
                 {t('accountsManage')}
               </button>
               {busy && (
-                <button type="button" style={styles.button} onClick={() => { void cancel(id) }}>
+                <button type="button" onClick={() => { void cancel(id) }}>
                   {t('cancel')}
                 </button>
               )}
@@ -929,12 +1033,11 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
                 <span style={styles.statusLine}>{t('deviceCodePrompt')}</span>
                 <span style={styles.deviceCodeText}>{deviceCode.userCode}</span>
                 <div style={styles.actions}>
-                  <button type="button" style={styles.button} onClick={() => { copyDeviceCode(id, deviceCode.userCode) }}>
+                  <button type="button" onClick={() => { copyDeviceCode(id, deviceCode.userCode) }}>
                     {copiedCode === id ? t('deviceCodeCopied') : t('deviceCodeCopy')}
                   </button>
                   <button
                     type="button"
-                    style={styles.button}
                     onClick={() => { window.open(deviceCode.verificationUrl, '_blank', 'noopener') }}
                   >
                     {t('deviceCodeOpenPage')}
@@ -952,7 +1055,7 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
                     placeholder={t('manualPlaceholder')}
                     onChange={event => setManualDrafts(prev => ({ ...prev, [id]: event.target.value }))}
                   />
-                  <button type="button" style={styles.button} onClick={() => { void submitManual(id) }}>
+                  <button type="button" onClick={() => { void submitManual(id) }}>
                     {t('submit')}
                   </button>
                 </div>
@@ -962,13 +1065,41 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
         )
       })}
       {managedProvider && <ProviderAccountManager provider={managedProvider.id} name={managedProvider.name}
-        rpc={rpc} t={t} onClose={() => setManagedProvider(undefined)} />}
+        rpc={rpc} t={t} onClose={() => { setManagedProvider(undefined); void refresh() }} />}
+      <style>{'.subscriptions-reset-dialog::backdrop { background: var(--dsw-alias-bg-mask-1, #0006); backdrop-filter: var(--dsw-mask-blur, none); }'}</style>
+      <dialog ref={resetDialogRef} className="subscriptions-reset-dialog"
+        aria-labelledby="subscriptions-reset-title" onCancel={() => setResetConfirmation(undefined)}
+        onClose={() => setResetConfirmation(undefined)}
+        style={{ ...styles.modal, display: resetConfirmation ? 'flex' : 'none', margin: 'auto', color: 'var(--dsw-alias-label-primary)' }}>
+        {resetConfirmation && <>
+          <h3 id="subscriptions-reset-title" style={{ ...styles.modalTitle, margin: 0 }}>{t('resetUseConfirmTitle')}</h3>
+          <p style={{ ...styles.statusLine, overflowWrap: 'anywhere' }}>{statuses.codex?.accounts.find(a => a.key === resetConfirmation.account)?.account ?? resetConfirmation.account}</p>
+          <div style={{ ...styles.usageMeta, gap: 12 }}>
+            <span>{t('usageWeekly')}</span><strong>{Math.round(resetConfirmation.weeklyUsedPercent)}%</strong>
+          </div>
+          <div style={styles.usageMeta}>
+            <span>{resetConfirmation.creditExpiresAt === undefined ? t('resetCreditExpiryUnknown') : t('resetCreditExpires', { date: new Date(resetConfirmation.creditExpiresAt).toLocaleString() })}</span>
+          </div>
+          <p style={{ ...styles.statusLine, margin: '4px 0' }}>{t('resetUseWarning')}</p>
+          <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', fontSize: 12 }}>
+            <input type="checkbox" checked={resetAcknowledged} onChange={e => setResetAcknowledged(e.target.checked)} />
+            {t('resetUseAcknowledge')}
+          </label>
+          <div className="dsh-subscription-dialog-actions" style={{ ...styles.actions, justifyContent: 'flex-end', marginTop: 8 }}>
+            <button type="button" autoFocus onClick={() => setResetConfirmation(undefined)}>{t('cancel')}</button>
+            <button type="button" className="dsh-subscription-primary"
+              style={{ opacity: resetAcknowledged ? 1 : 0.35, cursor: resetAcknowledged ? 'pointer' : 'not-allowed' }}
+              disabled={!resetAcknowledged || resetBusy}
+              onClick={() => { void consumeReset() }}>{t('resetUseConfirm')}</button>
+          </div>
+        </>}
+      </dialog>
       {proxyOpen && (
         <div style={styles.modalOverlay} onClick={() => setProxyOpen(false)}>
           <div style={styles.modal} onClick={event => event.stopPropagation()}>
             <div style={styles.modalHeader}>
               <span style={styles.modalTitle}>{t('proxyDialogTitle')}</span>
-              <button type="button" style={{ ...styles.button, marginLeft: 'auto' }} onClick={() => setProxyOpen(false)}>
+              <button type="button" style={{ marginLeft: 'auto' }} onClick={() => setProxyOpen(false)}>
                 {t('proxyDialogClose')}
               </button>
             </div>
@@ -1041,10 +1172,9 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
                   : t('proxyTestFail', { message: proxyTestResult.error ?? '' })}
               </p>
             )}
-            <div style={styles.proxyActions}>
+            <div className="dsh-subscription-dialog-actions" style={styles.proxyActions}>
               <button
                 type="button"
-                style={{ ...styles.button, ...proxyTesting ? { opacity: 0.5, cursor: 'default' } : {} }}
                 disabled={proxyTesting}
                 onClick={() => { void testProxy() }}
               >
@@ -1052,13 +1182,13 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
               </button>
               <button
                 type="button"
-                style={{ ...styles.button, ...proxySaving ? { opacity: 0.5, cursor: 'default' } : {} }}
+                className="dsh-subscription-primary"
                 disabled={proxySaving}
                 onClick={() => { void saveProxy() }}
               >
                 {proxySaving ? t('proxySaving') : t('proxySave')}
               </button>
-              <button type="button" style={styles.button} onClick={() => setProxyOpen(false)}>
+              <button type="button" onClick={() => setProxyOpen(false)}>
                 {t('proxyCancel')}
               </button>
             </div>

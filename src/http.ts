@@ -15,6 +15,7 @@
  */
 import { ProxyAgent, fetch as undiciFetch } from 'undici'
 import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { getDefaultAutoSelectFamilyAttemptTimeout, setDefaultAutoSelectFamilyAttemptTimeout } from 'node:net'
 import { dirname } from 'node:path'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 
@@ -87,6 +88,34 @@ export interface ProxyDraft {
 export const DEFAULT_PROXY_TEST_URL = 'https://api.x.ai/v1/models'
 /** Probe deadline; a hung proxy must not pin the Settings dialog forever. */
 export const DEFAULT_PROXY_TEST_TIMEOUT_MS = 15_000
+
+/**
+ * Minimum per-address connect attempt budget for Node's Happy Eyeballs
+ * (`net.autoSelectFamilyAttemptTimeout`). Node's default is 250ms, which is
+ * shorter than one TCP handshake to Cloudflare-fronted hosts (registry.npmjs.org,
+ * chatgpt.com) on a high-latency link: every address then fails with
+ * ETIMEDOUT and the whole fetch dies even though curl succeeds.
+ */
+export const MIN_CONNECT_ATTEMPT_TIMEOUT_MS = 1500
+
+/**
+ * Raise the process-wide Happy Eyeballs attempt timeout to at least `minMs`.
+ * Never lowers a host-configured value. The setting is per process (there is
+ * no per-dispatcher knob that survives the host's global dispatcher), so the
+ * plugin restores the previous value on dispose.
+ * @param minMs - the floor to enforce.
+ * @returns the value in effect before the call.
+ */
+export function ensureConnectAttemptTimeout(minMs = MIN_CONNECT_ATTEMPT_TIMEOUT_MS): number {
+  const previous = getDefaultAutoSelectFamilyAttemptTimeout()
+  if (previous < minMs) setDefaultAutoSelectFamilyAttemptTimeout(minMs)
+  return previous
+}
+
+/** Restore a value captured by {@link ensureConnectAttemptTimeout}. */
+export function restoreConnectAttemptTimeout(previous: number): void {
+  setDefaultAutoSelectFamilyAttemptTimeout(previous)
+}
 
 /** Disabled configuration: the module state before the first load. */
 const DISABLED: ProxyConfig = { enabled: false, url: '', bypass: [] }

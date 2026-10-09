@@ -168,6 +168,12 @@ export class PoolUsageTracker {
     }
   }
 
+  /** Refresh successful telemetry after a stream quota error without clearing a usage endpoint's 429 cooldown. */
+  invalidateSnapshot(provider: ProviderId, account: string): void {
+    const key = `${provider}/${account}`
+    if (this.entries.get(key)?.snapshot !== undefined) this.entries.delete(key)
+  }
+
   /** Drop cached snapshots: one account, or a whole provider when `account` is omitted. */
   invalidate(provider: ProviderId, account?: string): void {
     if (account !== undefined) {

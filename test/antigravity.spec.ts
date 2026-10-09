@@ -2,10 +2,11 @@
 
 import { test } from 'node:test'
 import { ToolCallId } from '../src/compat.js'
+import type { CompatibleContentBlock as ContentBlock, CompatibleMessage } from '../src/compat.js'
 import { AccountTokenManager } from '../src/providers/accounts.js'
 import assert from 'node:assert/strict'
 import { MessageId } from '@deepseek-ai/dsh-llm'
-import type { ContentBlock, GenerateOptions, Message, StreamChunk } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, Message, StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { AntigravitySession } from '../src/auth/store.js'
 import {
   AntigravityAdapter,
@@ -56,7 +57,7 @@ function routed(routes: Record<string, unknown | Response>, calls: RecordedCall[
   }
 }
 
-function message(role: Message['role'], content: ContentBlock[], source?: Message['source']): Message {
+function message(role: Message['role'], content: ContentBlock[], source?: Message['source']): CompatibleMessage {
   return {
     id: MessageId(`m-${Math.random().toString(36).slice(2)}`),
     role,
@@ -194,7 +195,7 @@ test('request conversion carries system, images, tools, tool results, and signed
       content: [{ type: 'image', mediaType: 'image/png', dataBase64: 'aGVsbG8=' }],
     },
   ]
-  const payload = toAntigravityRequest(options(messages as Message[]), messages, 'project-123')
+  const payload = toAntigravityRequest(options([]), messages, 'project-123')
   assert.equal(payload.project, 'project-123')
   assert.equal(payload.request.systemInstruction?.parts[0].text, 'Be useful.')
   assert.equal(payload.request.tools?.[0].functionDeclarations[0].name, 'bash')
@@ -203,8 +204,47 @@ test('request conversion carries system, images, tools, tool results, and signed
   assert.equal(modelParts[1].thoughtSignature, 'signed-thought')
   const result = payload.request.contents.flatMap(content => content.parts).find(part => part.functionResponse)
   assert.deepEqual(result?.functionResponse?.response, { ok: true })
+
+  for (const [content, expected] of [
+    ['["one","two"]', { output: ['one', 'two'] }],
+    ['null', { output: null }],
+    ['42', { output: 42 }],
+  ] as const) {
+    const resultPayload = toAntigravityRequest(options([]), [
+      message('assistant', [{ type: 'tool-call', id: ToolCallId('array-call'), name: 'bash', arguments: '{}' }]),
+      message('user', [{ type: 'tool-result', toolCallId: ToolCallId('array-call'), content: [{ type: 'text', text: content }] }]),
+    ], 'project-123')
+    const resultPart = resultPayload.request.contents.flatMap(entry => entry.parts).find(part => part.functionResponse)
+    assert.deepEqual(resultPart?.functionResponse?.response, expected)
+  }
   const image = payload.request.contents.flatMap(content => content.parts).find(part => part.inlineData)
   assert.equal(image?.inlineData?.data, 'aGVsbG8=')
+})
+
+test('first-class harness tool messages become correlated function responses', () => {
+  const messages: TranslatableMessage[] = [
+    message('assistant', [{ type: 'tool-call', id: ToolCallId('current-call'), name: 'bash', arguments: '{}' }]),
+    { role: 'tool', toolCallId: 'current-call', content: [{ type: 'text', text: 'done' }] },
+  ]
+  const parts = toAntigravityRequest(options([]), messages, 'project-123').request.contents.flatMap(entry => entry.parts)
+  assert.deepEqual(parts[1].functionResponse, {
+    id: 'current-call', name: 'bash', response: { output: 'done' },
+  })
+})
+
+test('failed tool results preserve their error flag in current and legacy histories', () => {
+  for (const text of ['permission denied', '{"error":"denied","isError":false}', '["denied"]']) {
+    const content = [{ type: 'text' as const, text }]
+    const results: TranslatableMessage[] = [
+      { role: 'tool', toolCallId: 'failed-call', isError: true, content },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: ToolCallId('failed-call'), isError: true, content }] },
+    ]
+    for (const result of results) {
+      const messages = [message('assistant', [{ type: 'tool-call', id: ToolCallId('failed-call'), name: 'bash', arguments: '{}' }]), result]
+      const parts = toAntigravityRequest(options([]), messages, 'project-123').request.contents.flatMap(entry => entry.parts)
+      assert.equal(parts[1]?.functionResponse?.response.isError, true, `${result.role}: ${text}`)
+    }
+  }
 })
 
 test('stream translator emits reasoning, text, tool call, usage, finish, and replay signature', () => {
@@ -262,7 +302,7 @@ test('streamGenerateContent SSE and generateContent URL/forwarding are both supp
   assert.deepEqual(streamed.map(chunk => chunk.type), ['block-start', 'text-delta', 'block-end', 'finish'])
 
   const calls: RecordedCall[] = []
-  const payload = toAntigravityRequest(options([message('user', [{ type: 'text', text: 'hi' }])]), [
+  const payload = toAntigravityRequest(options([]), [
     message('user', [{ type: 'text', text: 'hi' }]),
   ], session.projectId)
   await requestAntigravityContent(session, payload, false, runtime, routed({
@@ -526,6 +566,54 @@ test('Antigravity uses JSON Schema for Gemini and a detached custom-tool subset 
   assert.deepEqual(input.tools, original, 'do not mutate DSH registry schemas')
 })
 
+test('Antigravity custom tools widen alternatives instead of rejecting the request (#93)', () => {
+  const parameters = {
+    type: 'object',
+    properties: {
+      // DSH spreadsheet/document tools declare cell values like this.
+      cell: { description: 'value', oneOf: [{ type: 'string' }, { type: 'number' }, { type: 'boolean' }, { type: 'null' }] },
+      count: { anyOf: [{ type: 'integer' }, { type: 'number' }] },
+      loose: { type: ['string', 'number'] },
+      label: { oneOf: [{ type: 'string' }, { type: 'null' }] },
+      ids: { anyOf: [{ type: 'array', items: { type: 'string' } }, { type: 'array', items: { type: 'integer' } }] },
+      source: { oneOf: [
+        { type: 'object', properties: { kind: { type: 'string', const: 'url' }, url: { type: 'string' } }, required: ['kind', 'url'] },
+        { type: 'object', properties: { kind: { type: 'string', const: 'path' }, path: { oneOf: [{ type: 'string' }, { type: 'null' }] } }, required: ['kind'] },
+      ] },
+      range: { allOf: [
+        { type: 'object', properties: { start: { type: 'integer' } }, required: ['start'] },
+        { properties: { end: { type: 'integer' } }, required: ['end'] },
+      ] },
+    },
+    required: ['cell'],
+  }
+  const original = structuredClone(parameters)
+  for (const model of ['claude-sonnet-4-6', 'claude-opus-4-6-thinking', 'gpt-oss-120b-medium']) {
+    const input = { ...options([]), model, tools: [{ name: 'sheet', description: '', parameters }] }
+    const declaration = toAntigravityRequest(input, [], session.projectId).request.tools![0].functionDeclarations[0]
+    const properties = (declaration.parameters as { properties: Record<string, unknown> }).properties
+    // Heterogeneous alternatives are unconstrained rather than narrowed to one branch.
+    assert.deepEqual(properties.cell, { description: 'value' })
+    assert.deepEqual(properties.count, { type: 'number' })
+    assert.deepEqual(properties.loose, {})
+    assert.deepEqual(properties.label, { type: 'string' })
+    assert.deepEqual(properties.ids, { type: 'array', items: {} })
+    // Object alternatives keep every property, a discriminator's choices, and only shared requirements.
+    assert.deepEqual(properties.source, {
+      type: 'object',
+      properties: { kind: { type: 'string', enum: ['url', 'path'] }, url: { type: 'string' }, path: { type: 'string' } },
+      required: ['kind'],
+    })
+    // An intersection keeps every member's properties and requirements.
+    assert.deepEqual(properties.range, {
+      type: 'object',
+      properties: { start: { type: 'integer' }, end: { type: 'integer' } },
+      required: ['start', 'end'],
+    })
+  }
+  assert.deepEqual(parameters, original, 'do not mutate DSH registry schemas')
+})
+
 test('Antigravity rejects unresolved and recursive tool references before provider I/O', () => {
   for (const parameters of [
     { type: 'object', properties: { path: { $ref: '#/$defs/missing' } } },
@@ -564,6 +652,30 @@ test('Claude streaming caps maxOutputTokens at 64000 to avoid INVALID_ARGUMENT o
   assert.equal(claudeStreamLow.request.generationConfig?.maxOutputTokens, 2048)
 })
 
+test('Gemini 3 marks unsigned foreign tool-call steps during a model switch', () => {
+  const foreignSource = { kind: 'model' as const, provider: 'codex', model: 'gpt-5.6' }
+  const first = ToolCallId('foreign-1')
+  const second = ToolCallId('foreign-2')
+  const messages: TranslatableMessage[] = [
+    message('assistant', [
+      { type: 'tool-call', id: first, name: 'run_code', arguments: '{}' },
+      { type: 'tool-call', id: second, name: 'read', arguments: '{}' },
+    ], foreignSource),
+    message('user', [
+      { type: 'tool-result', toolCallId: first, content: [{ type: 'text', text: '{"ok":true}' }] },
+      { type: 'tool-result', toolCallId: second, content: [{ type: 'text', text: '{"ok":true}' }] },
+    ]),
+    message('assistant', [{ type: 'tool-call', id: ToolCallId('foreign-3'), name: 'run_code', arguments: '{}' }], foreignSource),
+  ]
+  const calls = toAntigravityRequest(options([]), messages, session.projectId).request.contents
+    .flatMap(content => content.parts).filter(part => part.functionCall)
+  assert.equal(calls[0].thoughtSignature, 'skip_thought_signature_validator')
+  assert.equal(calls[1].thoughtSignature, undefined)
+  assert.equal(calls[2].thoughtSignature, 'skip_thought_signature_validator')
+  const gemini2 = toAntigravityRequest({ ...options([]), model: 'gemini-2.5-pro' }, messages, session.projectId)
+  assert.equal(gemini2.request.contents.flatMap(content => content.parts).find(part => part.functionCall)?.thoughtSignature, undefined)
+})
+
 test('Antigravity replays signed text and reasoning only for the same provider and model', () => {
   const source = {
     kind: 'model' as const, provider: 'antigravity', model: 'gemini-3-flash',
@@ -572,12 +684,12 @@ test('Antigravity replays signed text and reasoning only for the same provider a
     ] },
   }
   const messages = [message('assistant', [{ type: 'reasoning', text: 'thought' }, { type: 'text', text: 'answer' }], source)]
-  const payload = toAntigravityRequest(options(messages), messages, session.projectId)
+  const payload = toAntigravityRequest(options([]), messages, session.projectId)
   assert.deepEqual(payload.request.contents[0].parts, [
     { thought: true, text: 'thought', thoughtSignature: 'reasoning-signature' },
     { text: 'answer', thoughtSignature: 'text-signature' },
   ])
-  const changed = toAntigravityRequest({ ...options(messages), model: 'claude-sonnet-4-6' }, messages, session.projectId)
+  const changed = toAntigravityRequest({ ...options([]), model: 'claude-sonnet-4-6' }, messages, session.projectId)
   assert.deepEqual(changed.request.contents[0].parts, [{ text: 'answer' }])
 })
 

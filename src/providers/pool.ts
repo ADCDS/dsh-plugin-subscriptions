@@ -5,7 +5,7 @@
  * one account is pinned to it. Tiers are extra picker rows. Member
  * selection is sticky per session (so prompt caches survive) and optionally
  * quota-aware; failures fail over to the next member as long as no stream
- * chunk has been emitted.
+ * content chunk has been emitted (leading usage remains buffered).
  */
 
 import {
@@ -18,14 +18,17 @@ import type {
   GenerateOptions,
   LlmModelInfo,
   LlmResolvedModelInfo,
+  PreparedAdapterCall,
   StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import type { ProviderId } from '../auth/store.js'
 import type { AccountAwareAdapter } from './accounts.js'
 import type { ConcretePoolMember, PoolDefinition, PoolMemberRef } from './pool-family.js'
 import { poolKey } from './pool-family.js'
-import { accountKey, classifyPoolFailure, memberKey, PoolHealthRegistry } from './pool-health.js'
+import { accountKey, classifyPoolFailure, CODEX_BURST_COOLDOWN_MS, memberKey, PoolHealthRegistry } from './pool-health.js'
 import type { MemberQuota, PoolUsageTracker } from './pool-usage.js'
+import { withAbortSignal } from './common.js'
+import { streamAccountWithReplay } from './replay.js'
 
 /** Member-selection strategy: plain priority failover or quota-aware scheduling. */
 export type PoolStrategy = 'priority' | 'quota_aware'
@@ -47,6 +50,8 @@ export interface PoolAdapterOptions {
   /** User-configured extra picker entries (heterogeneous fallbacks), by pool id. */
   tiers: Record<string, PoolMemberRef[]>
   onWarn: (message: string) => void
+  /** Injectable abortable backoff for deterministic pool tests. */
+  retryDelay?: (delayMs: number, signal: AbortSignal | undefined) => Promise<void>
 }
 
 /** Bound on sticky-session memory; oldest entries evict past it. */
@@ -61,6 +66,9 @@ function memberLabel(member: PoolMemberRef): string {
 
 /** How long a pools snapshot is trusted (auth changes invalidate immediately). */
 const POOLS_CACHE_TTL_MS = 5_000
+/** Bound on Codex retry rounds before model output. */
+const CODEX_MAX_ATTEMPTS = 20
+const CODEX_MAX_RETRY_DELAY_MS = 20_000
 
 export class PoolAdapter extends LlmAdapter {
   /** sessionId|poolId → member key of the last member that served a chunk. */
@@ -197,12 +205,17 @@ export class PoolAdapter extends LlmAdapter {
    * so a request valid for the pool stays valid after a failover. Capability
    * metadata is account-specific, so every distinct member is resolved.
    */
-  override async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
-    const definition = (await this.pools()).get(poolKey(provider, model))
+  override async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+    return (await this.prepareCall(provider, model, signal)).model
+  }
+
+  override async prepareCall(provider: string, model: string, signal?: AbortSignal): Promise<PreparedAdapterCall> {
+    const definition = (await withAbortSignal(() => this.pools(), signal)).get(poolKey(provider, model))
     if (definition === undefined) throw new LlmError(`unknown pool model "${model}"`, 'NO_ADAPTER')
     const resolved: LlmResolvedModelInfo[] = []
     let lastFailure: unknown
-    const members = await this.concrete(definition.members)
+    const members = await withAbortSignal(() => this.concrete(definition.members), signal)
+    const eligible: ConcretePoolMember[] = []
     for (const member of members) {
       const adapter = this.options.adapters[member.provider]
       if (adapter === undefined) continue
@@ -210,25 +223,28 @@ export class PoolAdapter extends LlmAdapter {
       // logged-out provider throwing AUTH): the pool serves as long as ONE
       // member resolves, mirroring stream()'s failover semantics.
       try {
-        resolved.push(await adapter.resolveOwnModel(member.provider, member.model, member.account))
+        resolved.push(await withAbortSignal(() => adapter.resolveOwnModel(member.provider, member.model, member.account), signal))
+        eligible.push(member)
       } catch (error: unknown) {
+        signal?.throwIfAborted()
         lastFailure = error
         this.warnOnce(
-          `pool "${model}": member ${memberLabel(member)} failed to resolve`
-          + ` (${error instanceof Error ? error.message : String(error)}); excluding it`,
+          `pool "${model}": member ${String(members.indexOf(member) + 1)} failed to resolve`
+          + ` (${error instanceof LlmError ? error.code : 'UNKNOWN'}); excluding it`,
         )
       }
     }
     if (resolved.length === 0) {
       throw new LlmError(`pool "${model}" has no usable member`, 'NO_ADAPTER', {
-        ...lastFailure === undefined ? {} : { cause: lastFailure },
+        ...lastFailure instanceof LlmError && lastFailure.failure.status !== undefined
+          ? { status: lastFailure.failure.status } : {},
       })
     }
     const contextWindows = resolved.map(info => info.context?.contextWindow).filter(isNumber)
     const maxTokens = resolved.map(info => info.defaultMaxTokens).filter(isNumber)
     const reasoning = intersectReasoning(resolved)
     const modalities = intersectModalities(resolved)
-    return {
+    const info: LlmResolvedModelInfo = {
       provider,
       id: model,
       name: definition.name ?? model,
@@ -238,73 +254,111 @@ export class PoolAdapter extends LlmAdapter {
       ...reasoning === undefined ? {} : { reasoning },
       ...modalities === undefined ? {} : { inputModalities: modalities },
     }
+    return { model: info, stream: options => this.streamMembers(options, eligible) }
   }
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
-    const definition = (await this.pools()).get(poolKey(options.provider, options.model))
+    const definition = (await withAbortSignal(() => this.pools(), options.signal)).get(poolKey(options.provider, options.model))
     if (definition === undefined) throw new LlmError(`unknown pool model "${options.model}"`, 'NO_ADAPTER')
-    const members = await this.concrete(definition.members)
-    const candidates = await this.select(options.model, members, options.sessionId)
-    if (candidates.length === 0) throw this.exhausted(options.model, members)
+    const members = await withAbortSignal(() => this.concrete(definition.members), options.signal)
+    yield* this.streamMembers(options, members)
+  }
+
+  private async *streamMembers(options: GenerateOptions, members: ConcretePoolMember[]): AsyncIterable<StreamChunk> {
     let lastError: unknown
-    for (const member of candidates) {
-      const adapter = this.options.adapters[member.provider]
-      if (adapter === undefined) continue
-      const iterator = adapter.streamAccount(
-        { ...options, provider: member.provider, model: member.model },
-        member.account,
-      )[Symbol.asyncIterator]()
-      let first: IteratorResult<StreamChunk>
-      try {
-        first = await iterator.next()
-        if (first.done === true) {
-          throw new LlmError(`${memberLabel(member)} returned an empty stream`, EMPTY_RESPONSE_CODE)
-        }
-      } catch (error: unknown) {
-        const classification = classifyPoolFailure(error, member.provider)
-        if (classification.action === 'throw') throw error
-        if ('cooldownMs' in classification) {
-          this.options.health.markUnavailable(
-            classification.scope === 'account'
-              ? accountKey(member.provider, member.account)
-              : memberKey(member.provider, member.account, member.model),
-            classification.cooldownMs,
-            classification.reason,
+    const failures = new Map<string, string>()
+    // Retry pre-output Codex transients before ending a turn or subagent activation.
+    // Other providers retain a single pool pass.
+    for (let attempt = 0; attempt < (options.provider === 'codex' ? CODEX_MAX_ATTEMPTS : 1); attempt++) {
+      if (options.signal?.aborted) throw new LlmError('pool request aborted by caller', 'ABORTED', { cause: options.signal.reason })
+      const candidates = await withAbortSignal(() => this.select(options.model, members, options.sessionId), options.signal)
+      for (const member of candidates) {
+        const adapter = this.options.adapters[member.provider]
+        if (adapter === undefined) continue
+        const iterator = streamAccountWithReplay(
+          adapter, { ...options, provider: member.provider }, member.account, member.model,
+        )[Symbol.asyncIterator]()
+        let first: IteratorResult<StreamChunk>
+        const leadingUsage: StreamChunk[] = []
+        try {
+          first = await iterator.next()
+          while (!first.done && first.value.type === 'usage') {
+            leadingUsage.push(first.value)
+            first = await iterator.next()
+          }
+          if (first.done === true) {
+            throw new LlmError(`${memberLabel(member)} returned an empty stream`, EMPTY_RESPONSE_CODE)
+          }
+          if (first.value.type === 'finish' && first.value.reason.kind === 'error') {
+            const failure = first.value.reason.failure
+            throw new LlmError(failure.message, failure.code, failure)
+          }
+        } catch (error: unknown) {
+          try { await iterator.return?.() } catch { /* preserve the attempt failure */ }
+          options.signal?.throwIfAborted()
+          const classification = classifyPoolFailure(error, member.provider)
+          if (classification.action === 'throw') throw error
+          if ('cooldownMs' in classification) {
+            this.options.health.markUnavailable(
+              classification.scope === 'account'
+                ? accountKey(member.provider, member.account)
+                : memberKey(member.provider, member.account, member.model),
+              classification.cooldownMs,
+              classification.reason,
+            )
+            // Refresh successful usage telemetry after a rejected stream, but
+            // do not clear a usage endpoint's own rate-limit cooldown.
+            if (classification.reason === QUOTA_EXCEEDED_CODE || classification.reason === 'RATE_LIMIT'
+              || classification.reason === 'CODEX_BURST_429') {
+              this.options.usage.invalidateSnapshot(member.provider, member.account)
+            }
+          }
+          this.options.onWarn(
+            `pool "${options.model}": member ${String(members.indexOf(member) + 1)} failed before any output`
+            + ` (${error instanceof LlmError ? error.code : 'UNKNOWN'}); trying the next member`,
           )
-          // A quota failure invalidates the cached usage snapshot so the NEXT
-          // selection re-polls instead of trusting minutes-old percentages.
-          // Transient/auth failures say nothing about quota — keep the cache.
-          if (classification.reason === QUOTA_EXCEEDED_CODE || classification.reason === 'RATE_LIMIT') {
-            this.options.usage.invalidate(member.provider, member.account)
+          failures.set(memberKey(member.provider, member.account, member.model),
+            'cooldownMs' in classification ? classification.reason : error instanceof LlmError ? error.code : 'UNKNOWN')
+          lastError = error
+          continue
+        }
+        this.remember(options.model, options.sessionId, member)
+        // Past the first chunk there is no clean attempt boundary: whatever
+        // the member does next (including failing) reaches the caller as-is.
+        // Closing a half-consumed member stream must not mask the outcome.
+        try {
+          yield* leadingUsage
+          yield first.value
+          for (let next = await iterator.next(); next.done !== true; next = await iterator.next()) {
+            yield next.value
+          }
+        } finally {
+          try {
+            await iterator.return?.()
+          } catch {
+            // Closing a half-consumed member stream must not mask the outcome.
           }
         }
-        this.options.onWarn(
-          `pool "${options.model}": ${memberLabel(member)} failed before any output`
-          + ` (${error instanceof Error ? error.message : String(error)}); trying the next member`,
-        )
-        lastError = error
-        continue
+        return
       }
-      this.remember(options.model, options.sessionId, member)
-      // Past the first chunk there is no clean attempt boundary: whatever
-      // the member does next (including failing) reaches the caller as-is.
-      // The finally closes the member stream when the CALLER walks away
-      // early (break / .return()) — manual iteration does not propagate
-      // closure the way `yield*` would, and a half-consumed member stream
-      // must not linger holding its connection.
-      try {
-        yield first.value
-        for (let next = await iterator.next(); next.done !== true; next = await iterator.next()) {
-          yield next.value
-        }
-      } finally {
-        try {
-          await iterator.return?.()
-        } catch {
-          // Closing a half-consumed member stream must not mask the outcome.
-        }
-      }
-      return
+      if (options.provider !== 'codex' || attempt + 1 >= CODEX_MAX_ATTEMPTS) break
+      const now = Date.now()
+      const eligible = members.flatMap(member => {
+        const key = memberKey(member.provider, member.account, member.model)
+        const reason = failures.get(key)
+        if (reason === undefined || !['CODEX_BURST_429', 'SERVER', 'TIMEOUT', 'EMPTY_RESPONSE', 'TRANSPORT'].includes(reason)) return []
+        const cooldown = this.options.health.memberCooldown(member.provider, member.account, member.model, now)
+        // A later account-wide quota/auth cooldown overrides a prior transient.
+        if (cooldown !== undefined && !['CODEX_BURST_429', 'SERVER', 'TIMEOUT', 'EMPTY_RESPONSE'].includes(cooldown.reason)) return []
+        const readyAt = cooldown?.until ?? now
+        // Never wait out a provider-disclosed long reset inside pool retries.
+        return readyAt - now <= CODEX_BURST_COOLDOWN_MS ? [{ readyAt }] : []
+      })
+      if (eligible.length === 0) break
+      const earliest = Math.min(...eligible.map(entry => entry.readyAt))
+      const backoffMs = Math.min(CODEX_MAX_RETRY_DELAY_MS, CODEX_BURST_COOLDOWN_MS * 2 ** Math.min(attempt, 10))
+      await (this.options.retryDelay ?? poolRetryDelay)(Math.max(backoffMs, earliest - Date.now()), options.signal)
+      continue
     }
     throw this.exhausted(options.model, members, lastError)
   }
@@ -366,28 +420,53 @@ export class PoolAdapter extends LlmAdapter {
     this.sticky.set(key, memberKey(member.provider, member.account, member.model))
   }
 
-  /**
-   * The error for an exhausted pool, carrying the earliest recovery hint of
-   * THIS pool's members (the health registry is shared across pools, so the
-   * hint is scoped to the keys this pool can actually recover through).
-   */
-  private exhausted(model: string, pool: ConcretePoolMember[], cause?: unknown): LlmError {
-    const keys = new Set<string>()
+  /** Earliest time a member clears both its own and its account's cooldown. */
+  private recovery(pool: ConcretePoolMember[], now = Date.now()): { until: number; reason: string } | undefined {
+    let first: { until: number; reason: string } | undefined
     for (const member of pool) {
-      keys.add(memberKey(member.provider, member.account, member.model))
-      keys.add(accountKey(member.provider, member.account))
+      const cooling = this.options.health.memberCooldown(member.provider, member.account, member.model, now)
+      if (cooling !== undefined && (first === undefined || cooling.until < first.until)) first = cooling
     }
-    const recovery = this.options.health.earliestRecovery(keys)
-    const retryAfterMs = recovery === undefined ? undefined : Math.max(recovery - Date.now(), 1)
+    return first
+  }
+
+  /** Report safe per-member cooldown reasons without exposing account identities or upstream bodies. */
+  private exhausted(model: string, pool: ConcretePoolMember[], cause?: unknown): LlmError {
+    const now = Date.now()
+    const cooldowns = pool.map(member => this.options.health.memberCooldown(member.provider, member.account, member.model, now))
+    const states = cooldowns.map((cooling, index) =>
+      `${String(index + 1)}:${cooling === undefined ? 'not cooling' : `${cooling.reason} (${cooling.scope}, ${String(Math.ceil((cooling.until - now) / 1_000))}s)`}`)
+    const recovery = this.recovery(pool, now)
+    const retryAfterMs = recovery === undefined ? undefined : Math.max(recovery.until - now, 1)
+    const reasons = cooldowns.map(cooling => cooling?.reason)
+    const reason = recovery?.reason
+    const code = cause instanceof LlmError ? cause.code : pool.length === 0 ? 'NO_ADAPTER'
+      : reasons.every(item => item === 'AUTH' || item === 'INVALID_CREDENTIAL' || item === 'MISSING_CREDENTIAL') ? 'AUTH'
+        : reasons.some(item => item === 'RATE_LIMIT' || item === 'CODEX_BURST_429' || item === QUOTA_EXCEEDED_CODE)
+          ? 'RATE_LIMIT' : reason ?? 'NO_ADAPTER'
+    const message = `pool "${model}" exhausted: ${pool.length === 0 ? 'no eligible account' : `members [${states.join(', ')}]`}`
+      + `${cause instanceof LlmError ? `; last failure ${cause.code}${cause.failure.status === undefined ? '' : ` (HTTP ${String(cause.failure.status)})`}` : ''}`
+    this.options.onWarn(message)
     return new LlmError(
-      `pool "${model}" exhausted: every member is unavailable or failed`,
-      'RATE_LIMIT',
-      {
-        ...retryAfterMs === undefined ? {} : { providerRetryAfterMs: retryAfterMs },
-        ...cause === undefined ? {} : { cause },
+      message,
+      code,
+      { ...retryAfterMs === undefined || code === 'AUTH' || code === 'NO_ADAPTER'
+        ? {} : { providerRetryAfterMs: retryAfterMs },
+        ...cause instanceof LlmError && cause.failure.status !== undefined ? { status: cause.failure.status } : {},
+        ...cause instanceof LlmError && cause.failure.requestId !== undefined ? { requestId: cause.failure.requestId } : {},
       },
     )
   }
+}
+
+/** Abortable local backoff between Codex pool rounds; no provider-reported long reset is waited here. */
+function poolRetryDelay(delayMs: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) { reject(new LlmError('pool request aborted by caller', 'ABORTED')); return }
+    const timer = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve() }, delayMs)
+    function onAbort(): void { clearTimeout(timer); reject(new LlmError('pool request aborted by caller', 'ABORTED')) }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
 }
 
 function stickyKey(poolId: string, sessionId: NonNullable<GenerateOptions['sessionId']>): string {

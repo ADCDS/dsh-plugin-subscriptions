@@ -4,6 +4,12 @@
 
 把你的 **ChatGPT(Codex)**、**Claude**、**Grok(X Premium)**、**GitHub Copilot** 和 **Google Antigravity** 订阅当作 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的 LLM provider 使用 —— 不需要 API key。Codex、Grok 和 Antigravity 通过 dsh web 界面 OAuth 登录(设置 → 订阅);Copilot 使用 GitHub OAuth 设备码流程;Claude 在存在 Claude Code 会话时直接导入凭据(macOS Keychain 或 `~/.claude/.credentials.json`),否则回退到同样的浏览器 OAuth 流程,因此不要求安装 Claude Code CLI。Token 保存在 `~/.dsh/plugins/subscriptions/auth.json`(权限 0600),过期自动刷新。
 
+## 订阅与模型显示名
+
+在 **设置 → 订阅 → 管理** 顶部修改订阅显示名，在 **编辑模型列表** 中修改模型显示名；使用同一组保存／取消按钮，留空或恢复默认后保存可恢复原名。名称按服务商和模型 ID 存储在原有 `provider-settings.json`，跨重启和目录刷新保留。名称为最多 80 字符的单行文本，仅改变显示，不改变 provider、模型 ID、推理参数或账号路由；现有账号别名可继续独立使用。
+
+订阅显示名也用于原生模型选择器的服务商分组标题；清空显示名并保存后，分组恢复为服务商默认名称。
+
 ## 演示
 
 设置 → **订阅**:每个 provider 的登录/退出,无需 API key。Claude 有 Claude Code 会话时导入凭据,否则和 Codex、Grok 一样走 OAuth(以下设置截图使用演示账号与目录数据):
@@ -30,7 +36,9 @@
 
 ![速度开关及其标准/快速菜单](https://raw.githubusercontent.com/V1ki/dsh-plugin-subscriptions/main/docs/images/speed-toggle.png)
 
-输入框下方的统计行会多出一个**订阅用量**胶囊，显示当前会话所选模型对应服务商的剩余额度窗口（选 GPT 模型时显示 Codex，选 Grok 模型时显示 Grok，以此类推）。点击即可展开查看所有已登录服务商及其全部账号 —— 默认账号带星标，当前服务商排在最前：
+输入框下方的统计行会多出一个**订阅用量**胶囊，显示当前会话所选模型对应服务商的已用百分比和重置窗口（选 Codex 模型时显示 Codex，选 Grok 模型时显示 Grok，以此类推）。状态栏最多显示一家：切到非订阅模型时，保留当前会话视图中最近选择的订阅；没有记录则隐藏。最近模型记录不会跨页面刷新保存。点击可展开查看所有已登录服务商及其全部账号 —— 默认账号带星标，当前服务商排在最前。Antigravity 仅预览当前模型的额度窗口（每个账号最多两个），其余模型窗口默认折叠，仍可点击展开。
+
+在 **设置 → 订阅 → 状态栏额度显示** 中可选择 **仅显示当前／最近使用的一家**（默认）或 **不显示**。显示偏好自动保存到当前浏览器，立即生效、刷新后保留，并在同源标签页之间同步；不影响设置页的额度详情、模型选择或账号路由。
 
 ![订阅用量胶囊展开后显示所有服务商与账号](https://raw.githubusercontent.com/V1ki/dsh-plugin-subscriptions/main/docs/images/usage-badge.png)
 
@@ -75,15 +83,25 @@ Codex 编辑走 `/backend-api/codex/images/edits`，Grok 编辑走 `/v1/images/e
 
 ## 安装
 
+### DSH 兼容性
+
+`0.9.7` 版本新增对 DSH `0.2.0-rc.2` 的支持，开发依赖已固定到该版本。适配请求态消息、独立工具结果、工具准备状态和已省略图片的文本占位，同时保留旧历史格式转换。不会自动放行其他 `0.2` 预发布版本。
+
+当前版本支持已发布的 DSH `0.1.1-rc.2`、`0.1.2-alpha`/`rc`、`0.1.3-alpha`、`0.1.5-alpha`/`rc` 和 `0.1.7-rc` 版本线，包括 `0.1.5-rc.2` 和 `0.1.7-rc.2`。peer 范围使用 `0.1.5-alpha.1` 作为锚点，按照 npm semver 规则也覆盖之后的 `0.1.5-alpha`、`0.1.5-rc` 和稳定版 `0.1.5`；`0.1.7-rc.1` 锚点同样覆盖之后的 `0.1.7-rc` 和稳定版 `0.1.7`。DSH `0.1.6-alpha` 和 `0.1.7-alpha` 尚未单独验证，因此暂不纳入支持范围。
+
 ### 管理账号与 Pool 模型
 
 在 **设置 → 订阅 → 对应 provider → 管理** 中编辑账号别名、自动 Pool 参与范围与独立账号模型入口。默认维持自动 Pool；独立入口固定使用一个账号，失效时不会回退到其他账号。此配置仅约束 LLM 路由，不改变图片、视频和搜索工具的账号策略。详见[账号与模型管理](docs/account-management.md)。
 
 ### 刷新模型列表
 
-在 **设置 → 订阅 → 对应 provider → 编辑模型列表** 中点击 **刷新**，可绕过五分钟目录缓存，并通知会话模型选择器重新读取。这与刷新订阅用量是两个独立操作。如果显式配置了非空的 `models.<provider>`，仍使用指定列表，不进行在线发现。
+模型选择器优先使用已保存的目录，包括非默认账号的目录；打开或切换已缓存模型时，不等待在线发现，也不会因此发起刷新。插件启动时检查目录，跳过五分钟内已更新的快照；本轮检查结束后，隔 60 分钟再检查。检查失败时保留已有目录，等待下一轮自动检查。没有任何目录缓存的账号，首次仍需等待在线发现。
 
-Codex 的目录可见性受请求中的 `client_version` 影响。默认自动读取 npm 官方 `@openai/codex` 包公开元数据中的稳定版本，不安装 CLI，也不向 npm 发送订阅登录凭据。查询成功后在内存缓存六小时；失败后五分钟再试，保留上次成功版本，首次失败则回退到已验证的 `0.153.4`。查询最多等待 1.5 秒，多账号共用查询，忽略预发布版和低于当前已知版本的结果。手动刷新模型列表也会重新检查版本。显式配置 `codexClientVersion: '0.153.4'` 时优先使用该值，并关闭自动查询；更改配置后需重启 DSH。模型仍以账号实际权限为准，详见[验证记录](docs/codex-catalog-refresh.md)。
+在 **设置 → 订阅 → 对应 provider → 编辑模型列表** 中点击 **刷新**，可立即获取最新目录并更新会话模型选择器。后台刷新成功后也会通知选择器重新读取。这与订阅用量、凭据刷新是独立机制，后二者行为保持不变。如果显式配置了非空的 `models.<provider>`，仍使用指定列表，不进行在线发现。
+
+Codex 的目录可见性受请求中的 `client_version` 影响。默认自动读取 npm 官方 `@openai/codex` 包公开元数据中的稳定版本，不安装 CLI，也不向 npm 发送订阅登录凭据。查询成功后在内存缓存六小时；失败后五分钟再试，保留上次成功版本，首次失败则回退到已验证的 `0.153.4`。查询最多等待 5 秒，多账号共用查询，忽略预发布版和低于当前已知版本的结果。插件加载时还会把 Node 的 Happy Eyeballs 单地址建连尝试超时提高到至少 1.5 秒（不会降低宿主已设的更大值），因为默认 250ms 在一次 TCP 握手就超过该值的高延迟链路上会让所有连接失败。手动刷新模型列表也会重新检查版本。显式配置 `codexClientVersion: '0.153.4'` 时优先使用该值，并关闭自动查询；更改配置后需重启 DSH。模型仍以账号实际权限为准，详见[验证记录](docs/codex-catalog-refresh.md)。
+
+Claude 请求以 Claude Code 的身份发出，接口会按 Claude Code 版本放行新模型（例如 Opus 5.5 要求 2.1.280 或更新）。因此插件会读取 npm 官方 `@anthropic-ai/claude-code` 包公开元数据中的 `latest` 版本，缓存、超时和重试规则与 Codex 查询相同，也不会向 npm 发送订阅登录凭据。上报的版本不会低于本机安装的 `claude` CLI 或插件内置的兜底版本；npm 不可达时就使用这个下限。手动刷新模型列表也会重新检查版本。**设置 → 订阅** 里，Codex 和 Claude 名称旁会显示当前使用的版本号及来源：npm 最新、本机 CLI、内置版本或手动配置。如果显示的是内置版本，说明 npm 查询没有成功。
 
 ### 安装命令
 
@@ -149,17 +167,17 @@ GitHub 安装的:重新执行一遍 `add github:V1ki/dsh-plugin-subscriptions` �
 
 ### 编辑模型列表、上下文与工具
 
-在 **设置 → 订阅 → 对应 provider → 编辑模型列表** 中搜索并勾选要显示的模型，再点击 **保存更改**。默认自动显示全部模型；手动勾选、全选或清空后会保存明确的显示列表，以后发现的新模型不会自动加入。重新勾选「自动显示全部模型」即可恢复。隐藏仅影响模型选择器和默认推理档列表，已有会话仍可使用隐藏模型；编辑器始终保留完整目录，可随时恢复显示。刷新目录不会覆盖选择，取消会丢弃尚未保存的编辑。
+在 **设置 → 订阅 → 对应 provider → 编辑模型列表** 中搜索并勾选要显示的模型，再点击 **保存更改**。默认自动显示全部模型；手动勾选、全选或清空后会保存明确的显示列表，以后发现的新模型不会自动加入。重新勾选「自动显示全部模型」即可恢复。隐藏仅影响模型选择器和默认推理档列表，已有会话仍可使用隐藏模型；编辑器始终保留完整目录，可随时恢复显示。刷新目录不会覆盖选择。对话框只有一组 **保存更改 / 取消**：保存会把模型列表与上方的账号设置一起提交，取消会同时丢弃两者并关闭对话框。
 
 Codex 模型还可填写上下文 token 数，留空跟随服务商。插件读取每个账号的 `context_window` 与 `max_context_window`，实际使用 `min(配置值, 账号最大值)`；未返回最大值时，保守地以上下文默认值为上限。账号池按实际成员分别解析并取最小窗口。这只调整 DSH 的本地上下文预算与压缩时机，不向 API 发送扩大容量的参数。更长的上下文可能增加响应延迟。
 
 同一区块可开关 Codex 的图片生成，以及 Grok 的图片生成、视频生成和 X 搜索。工具策略只影响保存后新建的会话；已有会话及其重启后的恢复保留创建时的策略。图片生成是共享工具，只有 Codex 与 Grok 均关闭或未配置时才完全隐藏；调用时也不会回退到该会话已禁用的 provider。Claude 和 Copilot 当前没有本插件提供的独立工具开关。
 
-设置和工具策略历史独立存于 `~/.dsh/plugins/subscriptions/provider-settings.json`（权限 0600），不受五分钟模型发现缓存过期影响。原有非空 `models.<provider>` 配置仍决定基础目录；界面显示选择在该目录上生效。
+设置和工具策略历史独立存于 `~/.dsh/plugins/subscriptions/provider-settings.json`（权限 0600），不受模型目录刷新影响。原有非空 `models.<provider>` 配置仍决定基础目录；界面显示选择在该目录上生效。
 
 ### 编辑模型的默认推理档
 
-默认推理档已合并进 **编辑模型列表**：每个支持推理档的模型在同一处配置显示、推理档和上下文，统一点击 **保存更改** 后生效。隐藏模型也可以设置推理档；没有推理档的模型不显示下拉框。选择「跟随服务商」清除覆盖，取消会恢复尚未保存的编辑。选项取自模型实时能力目录，账号池使用成员共同支持的档位；自定义池别名不提供无效的推理档覆盖。
+默认推理档已合并进 **编辑模型列表**：每个支持推理档的模型在同一处配置显示、推理档和上下文，统一点击对话框底部的 **保存更改** 后生效。隐藏模型也可以设置推理档；没有推理档的模型不显示下拉框。选择「跟随服务商」清除覆盖，取消会恢复尚未保存的编辑。选项取自模型实时能力目录，账号池使用成员共同支持的档位；自定义池别名不提供无效的推理档覆盖。
 
 原有推理档配置继续从 `~/.dsh/plugins/subscriptions/model-defaults.json`（权限 0600）读取并保存。若保存中途失败，界面会保留未完成的草稿，明确提示已经保存的推理档，并可重试完成。
 
@@ -171,6 +189,7 @@ Codex 模型还可填写上下文 token 数，留空跟随服务商。插件读�
   config:
     providers: [codex, claude]        # 子集;默认五个全启用
     streamIdleTimeoutMs: 300000
+    claudePromptCacheTtl: 5m           # Claude 提示缓存时长:5m(默认)或 1h
     rateLimit:
       wait: true                       # 等待限流窗口重开(默认开启)
       maxWaitMs: 21600000              # 单次等待上限;6 小时,足够覆盖 5 小时会话窗口
@@ -180,6 +199,20 @@ Codex 模型还可填写上下文 token 数，留空跟随服务商。插件读�
       copilot:                         # 手工条目会关闭 Copilot 目录发现
         - { id: gpt-5.6-sol, wire: responses }   # 仅 copilot:强制指定上游协议
 ```
+
+`claudePromptCacheTtl` 决定 Anthropic 在最近一次使用之后保留 Claude 对话缓存多久。默认 `5m` 发送的请求
+与之前的版本完全一致。设为 `1h` 时，每个缓存断点（工具+系统提示前缀，以及对话中的三个标记）都会带上
+`ttl: "1h"`；它们刻意使用同一个值，因为 Anthropic 会拒绝排在 5 分钟断点之后的 1 小时断点。缓存读取
+无论哪档价格相同；区别在于 1 小时档的*写入*按基础输入价的 2 倍定价，而不是 1.25 倍。
+如果你经常在两条消息之间停顿 5–60 分钟且能复用前缀，`1h` 可能更划算；收益取决于工作负载，不能据此
+保证订阅额度节省。如果经常在 5 分钟内复用缓存，更高的写入价格可能无法回本。Claude Code 自己在订阅下
+对主对话默认请求 1 小时，见
+[Claude Code 的提示缓存说明](https://code.claude.com/docs/en/prompt-caching#which-ttl-each-request-gets)。
+在已有缓存的对话上修改该设置可能产生一次前缀重写：带对话尾部缓存点的测试中，5 分钟写入之后的第一个
+1 小时请求重写了前缀，但只使用系统缓存点时可以命中。5 分钟请求可以读取 1 小时条目；用 1 小时标记读取
+旧的 5 分钟条目不会升级其生命周期。压缩（compaction）和会话标题请求保留原有辅助请求行为，仍使用 5 分钟。子代理
+（subagent）的请求没有插件可见的标记，因此与主对话一样遵循该设置。修改后需重启 DSH 生效，且只影响
+Claude；Codex、Grok、Copilot 与 Antigravity 使用各自的缓存机制。
 
 `wire`（仅 copilot 条目）把模型固定到 `chat-completions` 或 `responses`。不加该字段手工条目照常
 工作——它存在的原因是:实时目录不认识的手工模型否则会默认走 `/chat/completions`，而
@@ -202,7 +235,7 @@ Antigravity 为 Gemini 使用 `parametersJsonSchema`，为 Claude/GPT-OSS 使用
   `account` 填 `status` 接口返回的稳定账号 key——Claude 是邮箱,Grok / Copilot / Antigravity 是登录名。Codex 的 key 同时包含 workspace 和用户(`["<workspace-id>","user","<user-id>"]`),因此 Codex 也可以直接填登录邮箱,或在该 workspace 只登录了一个用户时填 workspace ID;有歧义的引用不会解析到任何账号,以免打到别人的账号。
 - **档位额外项(`tiers`,可选)**：额外的选择器条目,failover 可以跨模型;出现在首个成员所在的 provider 分组。不会自动创建。
 
-成员选择按会话粘性(prompt 缓存不失效),两种策略:`priority`(按顺序取第一个健康成员)和 `quota_aware`(默认——按"必需消耗速率 = 剩余配额 / 距重置时间"给成员打分,快重置且剩余多的窗口优先被用掉而不是浪费;粘性成员除非被挑战者以 `switchMargin` 倍分差击败否则不换)。任一用量窗口超过 95% 的成员会被硬门槛挡下;首个流式 chunk 之前的失败会记冷却并切换下一家(provider 给了 `retry-after` 就用它)——配额与认证类失败按整个账号冷却(配额是账号级的;Claude 的分模型窗口则只冷却出错成员),瞬时服务端失败只冷却出错成员。Copilot 没有用量接口,恒为 0 分,自然充当最后的保底。
+成员选择按会话粘性(prompt 缓存不失效),两种策略:`priority`(按顺序取第一个健康成员)和 `quota_aware`(默认——按"必需消耗速率 = 剩余配额 / 距重置时间"给成员打分,快重置且剩余多的窗口优先被用掉而不是浪费;粘性成员除非被挑战者以 `switchMargin` 倍分差击败否则不换)。任一用量窗口超过 95% 的成员会排在其他成员之后作为最后备选;首个流式 chunk 之前的失败会记冷却并切换下一家(provider 给了 `retry-after` 就用它)——配额与认证类失败按整个账号冷却(配额是账号级的;Claude 的分模型窗口则只冷却出错成员),瞬时服务端失败只冷却出错成员。Copilot 没有用量接口,恒为 0 分,自然充当最后的保底。
 
 ```yaml
 - id: llm-subscriptions
@@ -232,7 +265,7 @@ Antigravity 为 Gemini 使用 `parametersJsonSchema`，为 Claude/GPT-OSS 使用
 
 读取只发生在 429 上。其他失败仍走各自的短本地退避:同样这些 header 也会出现在瞬时 500 上,在那里照办等于为一次一秒就恢复的过载把本轮挂满整个窗口。
 
-有模型池时，真正在做等待这件事的其实是账号 failover：某个账号 429 了就按它自己披露的重开时刻冷却下来，请求立刻切到同 provider 的下一个账号 —— 不等待，也不丢本轮对话。只有**整个池**（所有账号）都在冷却时，adapter 才会上报一个 `RATE_LIMIT`，携带池里**最早**的重开时刻作为应等待的时长。单账号（没配池，或该 provider 只登了一个号）时，同样的披露时刻会被直接上报。
+有模型池时，某个账号遇到 429 会按服务端披露的重开时刻冷却，请求立即切到下一个账号。Codex 的 HTTP 429 如果既没有可解析的重开时刻，也没有 `retry-after`，即使用量接口仍显示有配额，也可能是突发限流：该账号只冷却两秒，而不是默认的五分钟。Codex 在输出首个 chunk 前遇到服务端错误、超时或空流时，成员也冷却两秒；对于可恢复的首个 chunk 前故障，池**最多尝试 20 轮请求**，各轮之间按 2、4、8、16 秒增长，之后最多间隔 20 秒。另一个账号正在长时间限流冷却时，瞬时故障的成员仍可恢复重试；不会提前探测长时间冷却的账号。调用者取消会结束等待，首个 chunk 后不再切换成员或重试。明确披露的长重置时间不会被缩短，也不会提前重新探测。最终错误仅列出成员序号、冷却原因和最后一个错误的 HTTP 状态，不显示账号标识或上游响应原文；仅有认证或瞬时故障时，不再错误标为 `RATE_LIMIT`。池报告的最早恢复时刻要求账号及对应模型成员都已解除冷却。没有模型池时，provider 的重置时间仍直接上报。
 
 真正执行这段等待的是 [`@deepseek-ai/dsh-llm-retry`](https://www.npmjs.com/package/@deepseek-ai/dsh-llm-retry)，五条路由的重试策略都是为它写的：把它加进编排，否则不会有任何等待，关闭的窗口仍旧直接让本轮失败（如果池里还有别的健康账号，会先 failover 过去）。Copilot 当前使用通用的 `retry-after` 信号；GitHub 未识别的限流 header 会通过插件告警回调暴露出来，后续再添加 provider 专用解析器。
 
@@ -271,14 +304,26 @@ DSH `v0.1.3-alpha.1` 新增宿主统一代理支持。建议在启动环境或 `
 ## 开发
 
 ```sh
-pnpm install   # devDependencies 用 link: 指向本地 deepseek-harness 检出 —— 先改成你的路径
+pnpm install   # 开发基线：已发布的 DSH 0.2.0-rc.2 依赖
 pnpm build     # tsc(lib/)+ tsdown(lib/client.js 浏览器 bundle)
 pnpm test      # 编译后跑 node --test 单测
 ```
 
 `prepare`(git 安装时触发)执行 `tsdown.prepare.config.ts`:自包含打包两个面,所有 `@deepseek-ai/*` 依赖外部化 —— 运行时从 dsh 安装解析,保证不会引入第二份 cordis。
 
+pnpm 的 package extension 为 Node 组件测试补齐已发布 UI primitives 的浏览器依赖；实际浏览器运行时仍由 DSH 提供这些库。
+
 改了代码后 `pnpm build` 并重启 `dsh web` 生效。
+
+### 发布
+
+发布由 GitHub Actions（[`release.yml`](.github/workflows/release.yml)）完成，不在维护者本机执行。修改 `package.json` 的 `version` 并提交后，推送同名 tag：
+
+```sh
+git tag v0.9.8 && git push origin main v0.9.8
+```
+
+工作流会校验 tag 与 `package.json` 版本一致，用锁定的 lockfile 安装依赖，执行 `pnpm build` 和 `pnpm test`，通过 [npm Trusted Publishing](https://docs.npmjs.com/trusted-publishers) 发布并附带 [provenance 证明](https://docs.npmjs.com/generating-provenance-statements)，最后创建带自动生成说明的 GitHub release。预发布版本（如 `0.10.0-rc.1`）发布到 `next` dist-tag。仓库中不保存任何 npm token：npm 通过 OIDC 对工作流鉴权，npm 包页面上的 provenance 可以将每个发布的 tarball 追溯到构建它的具体 commit 和工作流运行。
 
 ## 目录结构
 

@@ -1,10 +1,11 @@
 import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
-import type { GenerateOptions, LlmModelInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, PreparedAdapterCall, StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { ProviderId } from '../auth/store.js'
 import type { ProviderSettingsStore, AccountPreferences } from '../provider-settings.js'
 import type { AccountAwareAdapter } from './accounts.js'
-import { DISCOVERY_TIMEOUT_MS, withTimeout } from './common.js'
+import { DISCOVERY_TIMEOUT_MS, withAbortSignal, withTimeout } from './common.js'
 import type { PoolAdapter } from './pool.js'
+import { streamAccountWithReplay } from './replay.js'
 
 /** Reserved namespace, recognized even when malformed or no longer enabled. */
 export const ACCOUNT_MODEL_PREFIX = '~account:'
@@ -31,46 +32,62 @@ interface Options {
   settings: ProviderSettingsStore
   accounts: () => Promise<readonly { key: string; label: string }[]>
   pool: () => PoolAdapter | undefined
+  /** Per-account discovery bound (defaults to {@link DISCOVERY_TIMEOUT_MS}; tests shorten it). */
+  discoveryTimeoutMs?: number
 }
 
 /** Keeps the registered route separate from raw adapters and pool member seams. */
 export class AccountPreferencesAdapter extends LlmAdapter {
   constructor(private readonly options: Options) { super() }
+  override providerInfo(provider: string): LlmProviderInfo {
+    const info = this.options.adapter.providerInfo(provider)
+    // Native model groups read provider metadata, separately from model names.
+    return { ...info, name: this.options.settings.get(this.options.provider).displayName ?? info.name }
+  }
+  override providerRetryPolicy(provider: string) { return this.options.adapter.providerRetryPolicy(provider) }
   private preference(account: string): AccountPreferences | undefined {
     const accounts = this.options.settings.get(this.options.provider).accounts
     return accounts && Object.hasOwn(accounts, account) ? accounts[account] : undefined
   }
-  private async models(account: string): Promise<readonly LlmModelInfo[]> {
-    return await withTimeout(signal => this.options.adapter.listOwnModels(this.options.provider, account, signal), DISCOVERY_TIMEOUT_MS) ?? []
+  private async models(account: string, signal?: AbortSignal): Promise<readonly LlmModelInfo[]> {
+    const models = await withAbortSignal(() => withTimeout(
+      signal => this.options.adapter.listOwnModels(this.options.provider, account, signal, true),
+      this.options.discoveryTimeoutMs ?? DISCOVERY_TIMEOUT_MS,
+    ), signal)
+    if (models !== undefined) return models
+    // Discovery timed out: the catalog this account listed last time beats
+    // "no models", which would fail the turn with "No eligible account".
+    return await withAbortSignal(async () => this.options.adapter.lastKnownOwnModels?.(this.options.provider, account), signal) ?? []
   }
-  private async requireAccount(account: string, model: string, independent: boolean): Promise<void> {
-    if (!(await this.options.accounts()).some(entry => entry.key === account)
+  private async requireAccount(account: string, model: string, independent: boolean, signal?: AbortSignal): Promise<void> {
+    if (!(await withAbortSignal(this.options.accounts, signal)).some(entry => entry.key === account)
       || (independent ? this.preference(account)?.independentEntry !== true : !accountAllowsPool(this.preference(account), model))
-      || !(await this.models(account)).some(entry => entry.id === model)) {
+      || !(await this.models(account, signal)).some(entry => entry.id === model)) {
       throw new LlmError(`Account route unavailable: ${this.options.provider}/${account}/${model}`, 'NO_ADAPTER')
     }
   }
-  private async fallback(model: string): Promise<string> {
-    for (const { key } of await this.options.accounts()) {
+  private async fallback(model: string, signal?: AbortSignal): Promise<string> {
+    for (const { key } of await withAbortSignal(this.options.accounts, signal)) {
       if (!accountAllowsPool(this.preference(key), model)) continue
-      try { await this.requireAccount(key, model, false); return key } catch { /* unavailable catalog */ }
+      try { await this.requireAccount(key, model, false, signal); return key } catch { signal?.throwIfAborted() }
     }
     throw new LlmError(`No eligible account for ${this.options.provider}/${model}`, 'NO_ADAPTER')
   }
   /** Pool-only facade: explicit families/tiers must obey the same policy as auto pools. */
   poolMember(): AccountAwareAdapter {
     const raw = this.options.adapter
-    const keyFor = async (account: string | undefined, model: string): Promise<string> => {
+    const keyFor = async (account: string | undefined, model: string, signal?: AbortSignal): Promise<string> => {
       if (model.startsWith(ACCOUNT_MODEL_PREFIX)) throw new LlmError('Independent entries cannot be pool members', 'NO_ADAPTER')
-      const key = account ?? (await this.options.accounts())[0]?.key
+      const key = account ?? (await withAbortSignal(this.options.accounts, signal))[0]?.key
       if (!key) throw new LlmError('No account available', 'NO_ADAPTER')
-      await this.requireAccount(key, model, false)
+      await this.requireAccount(key, model, false, signal)
       return key
     }
     return new Proxy(raw, { get: (target, property) => {
       if (property === 'streamAccount') return async function* (options: GenerateOptions, account: string) {
         let key: string
-        try { key = await keyFor(account, options.model) } catch (cause) {
+        try { key = await keyFor(account, options.model, options.signal) } catch (cause) {
+          options.signal?.throwIfAborted()
           // Skip policy-excluded members without poisoning account health. The
           // pool treats TRANSPORT as switch-without-cooldown; raw is never called.
           throw new LlmError('Pool member unavailable under account preferences', 'TRANSPORT', { cause })
@@ -93,7 +110,7 @@ export class AccountPreferencesAdapter extends LlmAdapter {
         if (accountAllowsPool(preferences, model.id) && this.options.settings.visible(this.options.provider, model.id) && !result.has(model.id)) result.set(model.id, model)
         if (preferences?.independentEntry === true && this.options.settings.visible(this.options.provider, model.id)) {
           const id = accountModelId(key, model.id)
-          result.set(id, { ...model, id, name: `${preferences.alias || label} · ${model.name}` })
+          result.set(id, { ...model, id, name: `${preferences.alias || label} · ${this.options.settings.modelName(this.options.provider, model.id, model.name)}` })
         }
       }
     }
@@ -102,29 +119,57 @@ export class AccountPreferencesAdapter extends LlmAdapter {
       try { await this.options.pool()!.resolveModel(provider, model.id); result.set(model.id, model) } catch { /* excluded tier */ }
     }
     const priority = (model: LlmModelInfo): number => (model as LlmModelInfo & { priority?: number }).priority ?? Number.MAX_SAFE_INTEGER
-    return [...result.values()].sort((left, right) => priority(left) - priority(right))
+    return [...result.values()].map(model => ({ ...model,
+      name: this.options.settings.modelName(this.options.provider, model.id, model.name),
+    })).sort((left, right) => priority(left) - priority(right))
   }
-  override async resolveModel(provider: string, id: string): Promise<LlmResolvedModelInfo> {
+  override async resolveModel(provider: string, id: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+    return (await this.prepareCall(provider, id, signal)).model
+  }
+  override async prepareCall(provider: string, id: string, signal?: AbortSignal): Promise<PreparedAdapterCall> {
+    signal?.throwIfAborted()
     const independent = parseAccountModelId(id)
-    if (independent) {
-      await this.requireAccount(independent.account, independent.model, true)
-      const info = await this.options.adapter.resolveOwnModel(provider, independent.model, independent.account)
-      const label = (await this.options.accounts()).find(entry => entry.key === independent.account)?.label ?? independent.account
-      return { ...info, id, name: `${this.preference(independent.account)?.alias || label} · ${info.name}` }
-    }
     const pool = this.options.pool()
-    if (pool && await pool.owns(this.options.provider, id)) return pool.resolveModel(provider, id)
-    return this.options.adapter.resolveOwnModel(provider, id, await this.fallback(id))
+    if (!independent && pool && await withAbortSignal(() => pool.owns(this.options.provider, id), signal)) {
+      const prepared = await pool.prepareCall(provider, id, signal)
+      return { ...prepared, model: this.present(id, prepared.model) }
+    }
+    const account = independent?.account ?? await this.fallback(id, signal)
+    const model = independent?.model ?? id
+    if (independent) await this.requireAccount(account, model, true, signal)
+    const info = await withAbortSignal(() => this.options.adapter.resolveOwnModel(provider, model, account), signal)
+    const label = independent ? (await withAbortSignal(this.options.accounts, signal)).find(entry => entry.key === account)?.label ?? account : undefined
+    const owner = this
+    const named = this.present(model, info)
+    return {
+      model: independent ? { ...named, id, name: `${this.preference(account)?.alias || label} · ${named.name}` } : named,
+      async *stream(options) {
+        // Keep the capability-bearing account; revoked permission must fail instead of rerouting.
+        await owner.requireAccount(account, model, independent !== undefined, options.signal)
+        options.signal?.throwIfAborted()
+        yield* streamAccountWithReplay(owner.options.adapter, options, account, model)
+      },
+    }
+  }
+  /** Presentation only: routing still uses the original model id. */
+  private present(id: string, info: LlmResolvedModelInfo): LlmResolvedModelInfo {
+    return { ...info, name: this.options.settings.modelName(this.options.provider, id, info.name) }
   }
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     const independent = parseAccountModelId(options.model)
     if (independent) {
-      await this.requireAccount(independent.account, independent.model, true)
-      yield* this.options.adapter.streamAccount({ ...options, model: independent.model }, independent.account)
+      await this.requireAccount(independent.account, independent.model, true, options.signal)
+      options.signal?.throwIfAborted()
+      yield* streamAccountWithReplay(this.options.adapter, options, independent.account, independent.model)
       return
     }
     const pool = this.options.pool()
-    if (pool && await pool.owns(this.options.provider, options.model)) { yield* pool.stream(options); return }
-    yield* this.options.adapter.streamAccount(options, await this.fallback(options.model))
+    if (pool && await withAbortSignal(() => pool.owns(this.options.provider, options.model), options.signal)) {
+      yield* pool.stream(options)
+      return
+    }
+    const account = await this.fallback(options.model, options.signal)
+    options.signal?.throwIfAborted()
+    yield* streamAccountWithReplay(this.options.adapter, options, account)
   }
 }

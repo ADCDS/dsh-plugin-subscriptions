@@ -22,16 +22,30 @@
  * 'settings.subscriptions' namespace.
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { CSSProperties } from 'react'
+import type { ComponentType, CSSProperties } from 'react'
+import { subscriptionChromeCss } from './provider-settings-styles.js'
 import { createPortal } from 'react-dom'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type { ConnectionHandle } from '@deepseek-ai/dsh-api-remotes/client'
-import { IconDataOutline16, useAnchoredPosition, useDismissOnOutsidePointer } from '@deepseek-ai/dsh-client-ui-primitives'
+import * as primitives from '@deepseek-ai/dsh-client-ui-primitives'
+import { useAnchoredPosition, useDismissOnOutsidePointer } from '@deepseek-ai/dsh-client-ui-primitives'
 import { callSubscriptionsAuth, usageBarColor } from './SubscriptionsSection.js'
 import type { AccountStatus, ProviderStatus, ProviderUsage, SubscriptionProvider, UsageWindow } from './SubscriptionsSection.js'
 import type { ModelDirectoriesLike } from './SpeedSelect.js'
 import { en } from './locales.js'
 import type { SubscriptionsKey } from './locales.js'
+import { hostIcon } from './host-icons.js'
+import { useUsageBadgeMode } from './usage-badge-preferences.js'
+import { DISPLAY_NAME_CHANGED, type DisplayNameChange } from './display-name-events.js'
+
+/** DSH renamed the data icon in 0.1.7; retain older supported hosts too. */
+export function usageBadgeIcon(icons: {
+  IconDataOutlineRegular?: ComponentType
+  IconDataOutline16?: ComponentType
+}): ComponentType {
+  return hostIcon(icons, 'DataOutline')
+}
+const UsageBadgeIcon = usageBadgeIcon(primitives)
 
 /** How often the badge re-reads usage; the server also shares its own cache/negative-cache across UI surfaces. */
 const USAGE_POLL_INTERVAL_MS = 15 * 60_000
@@ -96,8 +110,8 @@ const PROVIDER_NAMES: Record<SubscriptionProvider, string> = {
  * The `currentModel` half of the inject face: the session's effective
  * model selection through ui-model-selection's `modelDirectories` service,
  * resolved lazily per call (the service may register after this plugin, and
- * a shell without it simply reports "unknown", which the badge treats as
- * "show every provider").
+ * a shell without it reports "unknown"; the badge keeps the most recent
+ * subscription selected in this view, or stays hidden).
  */
 export function createCurrentModelReader(
   models: () => ModelDirectoriesLike | undefined,
@@ -113,7 +127,7 @@ export function createCurrentModelReader(
 
 /**
  * Compact time-remaining label derived from the window's `resetsAt` timestamp:
- * "6d18h" (days+hours), "1h58m" (hours+minutes), or "42m" (minutes only).
+ * "6d 18h" (days+hours), "1h 58m" (hours+minutes), or "42m" (minutes only).
  * Falls back to the scope/kind abbreviation when no reset time is known.
  */
 export function windowLabel(w: UsageWindow): string {
@@ -129,8 +143,8 @@ export function windowLabel(w: UsageWindow): string {
   const minutes = Math.floor(ms / 60_000)
   const hours = Math.floor(minutes / 60)
   const days = Math.floor(hours / 24)
-  if (days > 0) return `${days}d${hours % 24}h`
-  if (hours > 0) return `${hours}h${minutes % 60}m`
+  if (days > 0) return `${days}d ${hours % 24}h`
+  if (hours > 0) return `${hours}h ${minutes % 60}m`
   return `${Math.max(1, minutes)}m`
 }
 
@@ -149,9 +163,13 @@ export function prioritizeWindows(windows: readonly UsageWindow[], model?: strin
 
 /** Small previews keep a live model catalog from taking over the dialog. */
 export const WINDOW_PREVIEW_LIMIT = 4
-export function previewWindows(windows: readonly UsageWindow[], model?: string) {
+export function previewWindows(windows: readonly UsageWindow[], model?: string, provider?: SubscriptionProvider) {
   const ordered = prioritizeWindows(windows, model)
-  return { shown: ordered.slice(0, WINDOW_PREVIEW_LIMIT), hidden: ordered.slice(WINDOW_PREVIEW_LIMIT) }
+  // Antigravity has many model-specific quotas: preview only the current model.
+  const limit = provider === 'antigravity'
+    ? Math.min(2, model === undefined ? 0 : windows.filter(w => w.scope === model).length)
+    : WINDOW_PREVIEW_LIMIT
+  return { shown: ordered.slice(0, limit), hidden: ordered.slice(limit) }
 }
 
 /** Bounded readout; Antigravity quotas belong to individual models, not the account. */
@@ -172,17 +190,23 @@ export function compactSegment(d: ProviderUsageDisplay, model?: string, t: Trans
   return `${d.name} ${parts.join(' · ')}`
 }
 
-/**
- * Pick what the collapsed pill shows: the current model's provider when its
- * usage is known, otherwise every provider (unknown model, a provider this
- * plugin does not serve, or a current provider with no usage to report).
- */
+type ModelSelection = { provider: string; model: string }
+
+/** Remember only the most recent subscription in this view, including its model scope. */
+export function retainSubscriptionSelection(
+  previous: ModelSelection | undefined,
+  current: ModelSelection | undefined,
+): ModelSelection | undefined {
+  return current !== undefined && Object.hasOwn(PROVIDER_NAMES, current.provider) ? current : previous
+}
+
+/** At most one provider; no known selection or no usage means no badge. */
 export function collapsedDisplays(
   displays: readonly ProviderUsageDisplay[],
   current: string | undefined,
 ): readonly ProviderUsageDisplay[] {
   const match = displays.find(d => d.provider === current)
-  return match === undefined ? displays : [match]
+  return match === undefined ? [] : [match]
 }
 
 /** Order for the expanded dialog: the current provider first, the rest in poll order. */
@@ -224,15 +248,18 @@ function usageWindowLabel(t: Translate, window: UsageWindow): string {
 
 /**
  * The composer subscription-usage badge: a pill reading e.g.
- * `Codex 6d1h 25%` for the current model's provider, opening a dialog with
+ * `Codex 6d 1h 25%` for the current model's provider, opening a dialog with
  * every provider's accounts and their windows. Returns null when no data is
  * available.
  */
 export function SubscriptionUsageBadge({ rpc, currentModel, t }: SubscriptionUsageBadgeProps) {
   const translate: Translate = t ?? fallbackTranslate
   const [displays, setDisplays] = useState<ProviderUsageDisplay[]>([])
-  const [selection, setSelection] = useState<{ provider: string; model: string } | undefined>(undefined)
+  const [selection, setSelection] = useState<ModelSelection | undefined>(undefined)
+  const [lastSubscription, setLastSubscription] = useState<ModelSelection | undefined>(undefined)
+  const displayMode = useUsageBadgeMode()
   const current = selection?.provider
+  const badgeSelection = retainSubscriptionSelection(lastSubscription, selection)
   const [open, setOpen] = useState(false)
   const [hover, setHover] = useState(false)
   const inflightRef = useRef(false)
@@ -252,10 +279,13 @@ export function SubscriptionUsageBadge({ rpc, currentModel, t }: SubscriptionUsa
   // account actually logs out or a fetch succeeds but reports the window as
   // unsupported.
   const lastKnownRef = useRef(new Map<string, UsageWindow[]>())
+  const namesRevision = useRef(0)
+  const recentNames = useRef(new Map<SubscriptionProvider, { revision: number; name: string }>())
 
   const refresh = useCallback(async (): Promise<void> => {
     if (rpc === undefined || inflightRef.current) return
     inflightRef.current = true
+    const revision = namesRevision.current
     try {
       const statusResp = await callSubscriptionsAuth<{
         providers: Record<SubscriptionProvider, ProviderStatus>
@@ -319,10 +349,14 @@ export function SubscriptionUsageBadge({ rpc, currentModel, t }: SubscriptionUsa
           windows,
         }
         const display = byProvider.get(provider)
-        if (display === undefined) byProvider.set(provider, { provider, name: PROVIDER_NAMES[provider], accounts: [row] })
+        if (display === undefined) byProvider.set(provider, { provider, name: statusResp.providers[provider]?.displayName || PROVIDER_NAMES[provider], accounts: [row] })
         else display.accounts.push(row)
       }
-      setDisplays([...byProvider.values()])
+      // A save during a slow quota poll wins over that poll's old status snapshot.
+      setDisplays([...byProvider.values()].map(row => {
+        const saved = recentNames.current.get(row.provider)
+        return saved && saved.revision > revision ? { ...row, name: saved.name } : row
+      }))
     } catch {
       // A failed poll must not crash the badge; keep last known state.
     } finally {
@@ -331,14 +365,28 @@ export function SubscriptionUsageBadge({ rpc, currentModel, t }: SubscriptionUsa
   }, [rpc])
 
   useEffect(() => {
+    const update = (event: Event) => {
+      const { provider, displayName } = (event as CustomEvent<DisplayNameChange>).detail
+      recentNames.current.set(provider, { revision: ++namesRevision.current, name: displayName || PROVIDER_NAMES[provider] })
+      setDisplays(current => current.map(row => row.provider === provider
+        ? { ...row, name: displayName || PROVIDER_NAMES[provider] } : row))
+    }
+    window.addEventListener(DISPLAY_NAME_CHANGED, update)
+    return () => { window.removeEventListener(DISPLAY_NAME_CHANGED, update) }
+  }, [])
+
+  useEffect(() => {
     mountedRef.current = true
+    return () => { mountedRef.current = false }
+  }, [])
+
+  // Hidden renders nothing, so it polls nothing; showing it again refreshes at once.
+  useEffect(() => {
+    if (displayMode === 'hidden') return
     void refresh()
     const timer = setInterval(() => { void refresh() }, USAGE_POLL_INTERVAL_MS)
-    return () => {
-      mountedRef.current = false
-      clearInterval(timer)
-    }
-  }, [refresh])
+    return () => { clearInterval(timer) }
+  }, [refresh, displayMode])
 
   useEffect(() => {
     if (currentRef.current === undefined) return
@@ -349,7 +397,11 @@ export function SubscriptionUsageBadge({ rpc, currentModel, t }: SubscriptionUsa
       if (read === undefined || inflight) return
       inflight = true
       void read().then(
-        (model) => { if (!cancelled) setSelection(model) },
+        (model) => {
+          if (cancelled) return
+          setLastSubscription(previous => retainSubscriptionSelection(previous, model))
+          setSelection(model)
+        },
         () => { /* keep the last known provider; the next tick retries */ },
       ).finally(() => { inflight = false })
     }
@@ -392,13 +444,18 @@ export function SubscriptionUsageBadge({ rpc, currentModel, t }: SubscriptionUsa
     return () => { observer.disconnect() }
   }, [])
 
+  useEffect(() => {
+    if (displayMode === 'hidden') setOpen(false)
+  }, [displayMode])
+
   const seat = <span ref={seatRef} style={styles.seat} aria-hidden />
+  const collapsed = collapsedDisplays(displays, badgeSelection?.provider)
+  if (displayMode === 'hidden' || collapsed.length === 0) return seat
 
-  if (displays.length === 0) return seat
-
-  const collapsed = collapsedDisplays(displays, current)
-  const label = collapsed.map(d => compactSegment(d, d.provider === current ? selection?.model : undefined, translate)).join(' | ')
-  const expanded = expandedDisplays(displays, current)
+  const label = compactSegment(collapsed[0]!, badgeSelection?.model, translate)
+  // The dialog opens from the badge, so it follows the provider and model the
+  // badge shows (a retained subscription when the current model is not one).
+  const expanded = expandedDisplays(displays, badgeSelection?.provider)
   const title = translate('usageBadgeTitle')
 
   const toggle = (): void => {
@@ -409,8 +466,10 @@ export function SubscriptionUsageBadge({ rpc, currentModel, t }: SubscriptionUsa
 
   const pill = (
     <span ref={rootRef} style={styles.anchor}>
+      <style>{subscriptionChromeCss}</style>
       <button
         type="button"
+        className="dsh-subscription-usage-pill"
         style={{ ...styles.pill, ...(hover || open ? styles.pillActive : {}) }}
         aria-haspopup="dialog"
         aria-expanded={open}
@@ -420,7 +479,7 @@ export function SubscriptionUsageBadge({ rpc, currentModel, t }: SubscriptionUsa
         onMouseLeave={() => { setHover(false) }}
         onClick={toggle}
       >
-        <IconDataOutline16 />
+        <UsageBadgeIcon />
         <span style={styles.label}>{label}</span>
       </button>
       {open && createPortal(
@@ -428,11 +487,12 @@ export function SubscriptionUsageBadge({ rpc, currentModel, t }: SubscriptionUsa
           ref={panelRef}
           role="dialog"
           aria-label={title}
+          className="dsh-subscription-usage-panel"
           style={{ ...styles.panel, ...(pos ?? MEASURE_STYLE) }}
         >
           <div style={styles.title}>
             <span style={styles.titleLabel}>
-              <IconDataOutline16 />
+              <UsageBadgeIcon />
               {title}
             </span>
           </div>
@@ -454,9 +514,10 @@ export function SubscriptionUsageBadge({ rpc, currentModel, t }: SubscriptionUsa
                     </div>
                   )}
                   <AccountWindows
-                    key={`${d.provider}:${selection?.model ?? ''}`}
+                    key={`${d.provider}:${badgeSelection?.model ?? ''}`}
                     windows={account.windows}
-                    model={d.provider === current ? selection?.model : undefined}
+                    model={d.provider === badgeSelection?.provider ? badgeSelection.model : undefined}
+                    provider={d.provider}
                     translate={translate}
                   />
                 </div>
@@ -508,10 +569,10 @@ function AccountMeta({ account, translate }: { account: AccountUsageDisplay; tra
 }
 
 /** Preview each account independently; all remaining quotas stay accessible. */
-export function AccountWindows({ windows, model, translate }: {
-  windows: readonly UsageWindow[]; model: string | undefined; translate: Translate
+export function AccountWindows({ windows, model, provider, translate }: {
+  windows: readonly UsageWindow[]; model: string | undefined; provider?: SubscriptionProvider; translate: Translate
 }) {
-  const { shown, hidden } = previewWindows(windows, model)
+  const { shown, hidden } = previewWindows(windows, model, provider)
   const rows = (items: readonly UsageWindow[]) => (
     <dl style={styles.details}>
       {items.map((w, i) => (
@@ -528,7 +589,7 @@ export function AccountWindows({ windows, model, translate }: {
   </>
 }
 
-/** One `dt`/`dd` pair: window name → `25% · 6d1h`, with the bar underneath. */
+/** One `dt`/`dd` pair: window name → `25% · 6d 1h`, with the bar underneath. */
 function WindowRow({ label, window: w }: { label: string; window: UsageWindow }) {
   const percent = usedPercent(w)
   return (
@@ -559,9 +620,9 @@ const styles: Record<string, CSSProperties> = {
   pill: {
     boxSizing: 'border-box', maxWidth: '100%',
     color: 'var(--dsw-alias-label-tertiary)',
-    font: 'inherit', fontSize: 'var(--dsh-content-font-size-secondary, 13px)',
-    fontVariantNumeric: 'tabular-nums', lineHeight: '20px', whiteSpace: 'nowrap',
-    background: 'transparent', border: 'none', borderRadius: 24,
+    font: 'inherit', fontSize: 'calc(var(--dsh-content-font-size-secondary, 13px) - 1px)',
+    fontVariantNumeric: 'tabular-nums', lineHeight: 'calc(20px + var(--dsh-content-font-delta-secondary, 0px))', whiteSpace: 'nowrap',
+    background: 'transparent', border: 'none', borderRadius: 999,
     alignItems: 'center', gap: 6, padding: '1px 8px', display: 'inline-flex', cursor: 'pointer',
   },
   pillActive: {
@@ -577,7 +638,7 @@ const styles: Record<string, CSSProperties> = {
     maxHeight: 'min(560px, 100dvh - 24px)', overflowY: 'auto', overscrollBehavior: 'contain',
     boxShadow: 'var(--dsw-elevation-prominent)',
     color: 'var(--dsw-alias-label-secondary)', cursor: 'default',
-    border: 0, borderRadius: 12, padding: 16, fontSize: 12, lineHeight: '18px',
+    border: 0, borderRadius: 'var(--dsw-radius-lg, 16px)', padding: 16, fontSize: 12, lineHeight: '18px',
   },
   title: {
     color: 'var(--dsw-alias-label-primary)', display: 'flex',

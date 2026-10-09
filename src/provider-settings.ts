@@ -12,6 +12,9 @@ export const PROVIDER_TOOLS = {
   antigravity: [],
 } as const
 export type SubscriptionTool = 'image_generate' | 'video_generate' | 'x_search' | 'web_search'
+/** Mirrors `PromptCacheTtl` in translate/anthropic.ts; kept here so the client bundle needs no translate import. */
+export const PROMPT_CACHE_TTLS = ['5m', '1h'] as const
+export type PromptCacheTtlSetting = typeof PROMPT_CACHE_TTLS[number]
 export interface AccountPreferences {
   alias?: string
   /** Absent means included. */
@@ -22,11 +25,16 @@ export interface AccountPreferences {
   poolModels?: string[]
 }
 export interface ProviderPreferences {
+  /** Presentation only; never used as a provider or model routing key. */
+  displayName?: string
+  modelDisplayNames?: Record<string, string>
   accounts?: Record<string, AccountPreferences>
   /** Absent follows discovery; an explicit selection hides newly discovered models. */
   visibleModels?: string[]
   contextWindows?: Record<string, number>
   tools?: Partial<Record<SubscriptionTool, boolean>>
+  /** Claude only: overrides the plugin config's `claudePromptCacheTtl`; absent follows config. */
+  promptCacheTtl?: PromptCacheTtlSetting
 }
 interface ToolRevision {
   at: number
@@ -42,6 +50,28 @@ export function validatePreferences(provider: ProviderId, input: unknown): Provi
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('settings must be an object')
   const raw = input as Record<string, unknown>
   const result: ProviderPreferences = {}
+  const nameOf = (value: unknown): string => {
+    if (typeof value !== 'string' || value.trim().length > 80 || /[\u0000-\u001f\u007f]/.test(value)) {
+      throw new Error('display name must be a single line of at most 80 characters')
+    }
+    return value.trim()
+  }
+  if (raw.displayName !== undefined) {
+    const name = nameOf(raw.displayName)
+    if (name) result.displayName = name
+  }
+  if (raw.modelDisplayNames !== undefined) {
+    if (!raw.modelDisplayNames || typeof raw.modelDisplayNames !== 'object' || Array.isArray(raw.modelDisplayNames)) {
+      throw new Error('modelDisplayNames must be a model-to-name map')
+    }
+    const names: Record<string, string> = Object.create(null) as Record<string, string>
+    for (const [id, value] of Object.entries(raw.modelDisplayNames)) {
+      if (!id.trim()) throw new Error('model display name requires a model id')
+      const name = nameOf(value)
+      if (name) names[id] = name
+    }
+    if (Object.keys(names).length) result.modelDisplayNames = names
+  }
   if (raw.accounts !== undefined) {
     if (!raw.accounts || typeof raw.accounts !== 'object' || Array.isArray(raw.accounts)) throw new Error('accounts must be an account-to-preferences map')
     result.accounts = Object.create(null) as Record<string, AccountPreferences>
@@ -84,6 +114,13 @@ export function validatePreferences(provider: ProviderId, input: unknown): Provi
       }
       result.contextWindows[model] = value
     }
+  }
+  if (raw.promptCacheTtl !== undefined) {
+    if (provider !== 'claude') throw new Error('promptCacheTtl is currently supported only for Claude')
+    if (!(PROMPT_CACHE_TTLS as readonly unknown[]).includes(raw.promptCacheTtl)) {
+      throw new Error(`promptCacheTtl must be one of ${PROMPT_CACHE_TTLS.join(', ')}`)
+    }
+    result.promptCacheTtl = raw.promptCacheTtl as PromptCacheTtlSetting
   }
   if (raw.tools !== undefined) {
     if (!raw.tools || typeof raw.tools !== 'object' || Array.isArray(raw.tools)) throw new Error('tools must be an object')
@@ -130,9 +167,19 @@ export class ProviderSettingsStore {
     return this.current.providers[provider]?.visibleModels?.includes(model) ?? true
   }
 
+  modelName(provider: ProviderId, model: string, fallback: string): string {
+    const names = this.current.providers[provider]?.modelDisplayNames
+    return names && Object.hasOwn(names, model) ? names[model] : fallback
+  }
+
   contextWindow(model: string): number | undefined {
     const windows = this.current.providers.codex?.contextWindows
     return windows && Object.hasOwn(windows, model) ? windows[model] : undefined
+  }
+
+  /** The Settings-page Claude cache TTL; undefined follows the plugin config. Read per request, so no clone. */
+  promptCacheTtl(): PromptCacheTtlSetting | undefined {
+    return this.current.providers.claude?.promptCacheTtl
   }
 
   /** Creation-time policy survives restarts and never changes an existing session. */

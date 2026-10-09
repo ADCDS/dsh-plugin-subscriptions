@@ -15,7 +15,7 @@ import {
   QUOTA_EXCEEDED_CODE,
   ReasoningEffortId,
 } from '@deepseek-ai/dsh-llm'
-import { rateLimitDiagnostics, retryAfterInstant, waitFromReset } from './rate-limit.js'
+import { durationMs, rateLimitDiagnostics, retryAfterInstant, waitFromReset } from './rate-limit.js'
 import type { RateLimitResetReader } from './rate-limit.js'
 
 /** One configured model catalog entry. */
@@ -146,7 +146,7 @@ export async function httpLlmError(
   // re-hitting the same closed window.
   const rateLimited = response.status === 429
   const reset = rateLimited
-    ? options.rateLimitReset?.(response, body, now) ?? retryAfterInstant(response, now)
+    ? options.rateLimitReset?.(response, body, now) ?? googleQuotaReset(body, now) ?? retryAfterInstant(response, now)
     : retryAfterInstant(response, now)
   if (reset === undefined && rateLimited) {
     options.onWarn?.(`${label}: ${rateLimitDiagnostics(response, body)}`)
@@ -155,6 +155,31 @@ export async function httpLlmError(
     status: response.status,
     ...reset === undefined ? {} : { providerRetryAfterMs: waitFromReset(reset, now) },
   })
+}
+
+/**
+ * Read a Google RPC quota reset from a 429 body.
+ *
+ * Antigravity discloses the window in `quotaResetDelay` and
+ * `quotaResetTimeStamp` and supplies no rate-limit reader. A wait beyond the
+ * route's delay ceiling makes the retry plugin fail the turn immediately
+ * rather than spending its local retry budget on a closed window. The
+ * relative delay wins: it is measured from this response, so a skewed local
+ * clock cannot stretch or erase it the way it would an absolute timestamp.
+ * @param body - the complete response body.
+ * @param now - the current epoch milliseconds.
+ * @returns the reset instant, or undefined when the body does not name one.
+ */
+function googleQuotaReset(body: string, now: number): number | undefined {
+  const delay = /"quotaResetDelay"\s*:\s*"([^"]+)"/.exec(body)
+  if (delay !== null) {
+    const ms = durationMs(delay[1])
+    if (ms !== undefined && ms > 0) return now + ms
+  }
+  const stamp = /"quotaResetTimeStamp"\s*:\s*"([^"]+)"/.exec(body)
+  if (stamp === null) return undefined
+  const instant = Date.parse(stamp[1])
+  return Number.isFinite(instant) && instant > now ? instant : undefined
 }
 
 /**
@@ -261,7 +286,12 @@ export class OAuthEndpointError extends Error {
 }
 
 /**
- * Read an OAuth JSON error body into an {@link OAuthEndpointError}.
+ * Read an OAuth JSON error body into an {@link OAuthEndpointError}. Two body
+ * shapes are understood: RFC 6749 (`{ error: "invalid_grant", error_description }`)
+ * and the OpenAI API envelope the auth.openai.com token endpoint now answers
+ * with (`{ error: { code: "refresh_token_reused", message } }`). The code
+ * must land in `oauthCode` either way — the permanent-failure classifiers
+ * key on it, and an unrecognized shape would keep a dead login forever.
  * @param response - the failed token-endpoint response.
  * @param label - diagnostic prefix naming the provider.
  * @returns the error to throw.
@@ -270,9 +300,16 @@ export async function oauthEndpointError(response: Response, label: string): Pro
   let oauthCode: string | undefined
   let detail = ''
   try {
-    const parsed = await response.json() as { error?: string; error_description?: string }
-    oauthCode = typeof parsed.error === 'string' ? parsed.error : undefined
-    detail = typeof parsed.error_description === 'string' ? parsed.error_description : (oauthCode ?? '')
+    const parsed = await response.json() as { error?: unknown; error_description?: unknown }
+    if (typeof parsed.error === 'string') {
+      oauthCode = parsed.error
+    } else if (typeof parsed.error === 'object' && parsed.error !== null) {
+      const nested = parsed.error as { code?: unknown; message?: unknown }
+      if (typeof nested.code === 'string' && nested.code.length > 0) oauthCode = nested.code
+      if (typeof nested.message === 'string') detail = nested.message
+    }
+    if (typeof parsed.error_description === 'string') detail = parsed.error_description
+    if (detail.length === 0) detail = oauthCode ?? ''
   } catch {
     // Only swallow error-body parsing: the HTTP status still identifies the failure.
   }
@@ -414,6 +451,21 @@ export type FetchFn = typeof fetch
 /** Bound on one account catalog fetch or usage poll — a hang must not block the picker. */
 export const DISCOVERY_TIMEOUT_MS = 10_000
 
+/** Cancel one caller's wait without cancelling catalog work shared with other callers. */
+export async function withAbortSignal<T>(work: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  signal?.throwIfAborted()
+  if (signal === undefined) return work()
+  return new Promise<T>((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener('abort', abort)
+    const abort = () => { cleanup(); reject(signal.reason) }
+    signal.addEventListener('abort', abort, { once: true })
+    Promise.resolve().then(() => { signal.throwIfAborted(); return work() }).then(
+      value => { cleanup(); resolve(value) },
+      error => { cleanup(); reject(error) },
+    )
+  })
+}
+
 /**
  * Run `work` with an aborting signal. Resolves undefined when the timeout
  * fires (the fetch is aborted); other failures propagate.
@@ -451,6 +503,13 @@ export interface UsageWindow {
   resetsAt?: number
 }
 
+/** One banked Codex reset credit, returned by the private ChatGPT backend API. */
+export interface ResetCredit {
+  id?: string
+  grantedAt?: number
+  expiresAt?: number
+}
+
 /** Subscription usage of one provider, as served by the `usage` RPC endpoint. */
 export interface ProviderUsage {
   /** False when the provider has no usage endpoint (grok); windows are absent then. */
@@ -459,6 +518,10 @@ export interface ProviderUsage {
   windows?: UsageWindow[]
   /** Plan name the usage endpoint reported, when present. */
   plan?: string
+  /** Available banked Codex full resets, when the backend discloses them. */
+  resetCredits?: ResetCredit[]
+  /** Optional reset lookup failure; ordinary usage remains usable. */
+  resetCreditsError?: string
 }
 
 /** One model discovered from a provider's live model-list endpoint. */
@@ -581,7 +644,7 @@ export async function discoverAcrossAccounts(
   return undefined
 }
 
-/** How long a discovered catalog is trusted before re-fetching. */
+/** Skip scheduled refreshes when the last successful catalog is this recent. */
 export const DISCOVERY_TTL_MS = 5 * 60_000
 
 /** A durable snapshot of one provider's discovered catalog. */
@@ -606,10 +669,10 @@ export interface CatalogPersistence {
  * when to REFRESH; it never makes the cache forget: capability metadata
  * (reasoning efforts) must stay stable for a session that selected an effort,
  * or mid-conversation calls fail UNSUPPORTED_REASONING_EFFORT the moment the
- * cache goes stale. `listModels` awaits freshness via {@link get};
- * `resolveModel` uses {@link resolve}, which serves the last-known catalog
- * while a stale entry refreshes in the background, and only awaits the fetch
- * when nothing is known yet. An optional {@link CatalogPersistence} seeds the
+ * cache goes stale. `get` awaits freshness unless its caller opts into
+ * cache-only picker/routing reads. The startup/hourly job owns automatic
+ * refreshes; `resolveModel` uses {@link resolve}, which serves the last-known
+ * catalog and only awaits the fetch when nothing is known yet. An optional {@link CatalogPersistence} seeds the
  * last-known state across restarts and receives every successful fetch. A 401
  * that still fails after a forced token refresh must call {@link invalidate}.
  */
@@ -626,6 +689,7 @@ export class ModelCatalogCache {
   constructor(
     private readonly persistence?: CatalogPersistence,
     private readonly ttlMs = DISCOVERY_TTL_MS,
+    private readonly onChanged?: () => void,
   ) {}
 
   /**
@@ -667,10 +731,12 @@ export class ModelCatalogCache {
     const pending = fetcher()
       .then((models) => {
         if (this.generation !== gen) return models
+        const changed = this.entry === undefined || JSON.stringify(this.entry.models) !== JSON.stringify(models)
         const snapshot: CatalogSnapshot = { at: Date.now(), models }
         this.entry = snapshot
         // Write-through is fire-and-forget: a failed save only costs durability.
         void this.persistence?.save(snapshot).catch(() => undefined)
+        if (changed) this.onChanged?.()
         return models
       })
       .finally(() => {
@@ -683,19 +749,27 @@ export class ModelCatalogCache {
   /**
    * Return the cached catalog when fresh, otherwise fetch and cache it.
    * @param fetcher - performs the provider's model-list request.
+   * @param preferCached - serve saved metadata; the startup/hourly job owns automatic refreshes.
    * @returns the discovered models.
    * @throws the fetcher's failure (the `listModels` caller warns and falls back).
    */
-  async get(fetcher: () => Promise<DiscoveredModel[]>): Promise<readonly DiscoveredModel[]> {
+  async get(fetcher: () => Promise<DiscoveredModel[]>, preferCached = false): Promise<readonly DiscoveredModel[]> {
     await this.ensureSeeded()
-    return this.cached() ?? this.refresh(fetcher)
+    const fresh = this.cached()
+    if (fresh !== undefined) return fresh
+    if (preferCached && this.entry !== undefined) {
+      // Menu reads do not increase network frequency. Scheduled and explicit
+      // refreshes call get without preferCached and still honor the five-minute TTL.
+      return this.entry.models
+    }
+    return this.refresh(fetcher)
   }
 
   /**
    * The models for capability resolution. A fresh cache answers directly; a
-   * stale one answers immediately from the last-known catalog while a
-   * background refresh runs (a mid-conversation `resolveModel` must neither
-   * block on nor fail with the network); a cold cache awaits one fetch.
+   * stale one answers immediately from the last-known catalog. Only the
+   * startup/hourly job refreshes known metadata automatically; a cold cache
+   * awaits one fetch.
    * @param fetcher - performs the provider's model-list request.
    * @returns the models, or `undefined` when nothing is known (the caller
    *   falls back to its static metadata). Never throws.
@@ -705,11 +779,7 @@ export class ModelCatalogCache {
     const fresh = this.cached()
     if (fresh !== undefined) return fresh
     const known = this.entry?.models
-    if (known !== undefined) {
-      // Stale-while-revalidate: the refresh outcome serves the NEXT resolve.
-      this.refresh(fetcher).catch(() => undefined)
-      return known
-    }
+    if (known !== undefined) return known
     try {
       return await this.refresh(fetcher)
     } catch {
@@ -743,8 +813,13 @@ export function isDiscoveryAborted(error: unknown, signal?: AbortSignal): boolea
     && (error.name === 'AbortError' || error.name === 'TimeoutError')
 }
 
-/** Whether discovery failed because the access token was rejected. */
-function isDiscoveryAuthFailure(error: unknown): boolean {
+/**
+ * Whether discovery failed because the access token was rejected. After
+ * {@link discoverOrRetryAuth} this means the token was rejected AGAIN right
+ * after a forced refresh: the login is dead server-side (revoked) even though
+ * the refresh grant still answers, so the store keeps the session.
+ */
+export function isDiscoveryAuthFailure(error: unknown): boolean {
   return (error instanceof OAuthEndpointError && error.status === 401)
     || (error instanceof LlmError && error.code === 'AUTH')
 }

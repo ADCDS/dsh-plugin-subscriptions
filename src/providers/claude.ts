@@ -18,7 +18,7 @@ import type { ClaudeSession } from '../auth/store.js'
 import type { ProviderId } from '../auth/store.js'
 import type { PoolAdapter } from './pool.js'
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
-import { resolveImages } from '../translate/resolved.js'
+import { hostSupportsImageOffload, IMAGE_OFFLOAD_REQUIRED, requiredImageOffloadCount, resolveImages } from '../translate/resolved.js'
 import type { TranslatableMessage } from '../translate/resolved.js'
 import {
   markMessageCache,
@@ -27,6 +27,7 @@ import {
   toAnthropicSystem,
   toAnthropicTools,
 } from '../translate/anthropic.js'
+import type { PromptCacheTtl } from '../translate/anthropic.js'
 import {
   httpLlmError,
   idleWatchdog,
@@ -43,6 +44,8 @@ import {
 import { AccountTokenManager, DISCOVERY_TIMEOUT_MS, unionAccountCatalogs } from './accounts.js'
 import type { CatalogPersistence, DiscoveredModel, FetchFn, ModelEntry, ProviderUsage, UsageWindow } from './common.js'
 import { proxiedFetch } from '../http.js'
+import { compareVersions } from './npm-cli-version.js'
+import type { CliVersion } from './npm-cli-version.js'
 import {
   DEFAULT_RATE_LIMIT_WAIT,
   DEFAULT_RETRY,
@@ -62,6 +65,7 @@ export const CLAUDE_PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile'
 export const CLAUDE_MODELS_URL = 'https://api.anthropic.com/v1/models?beta=true'
 export const CLAUDE_SCOPE = 'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload'
 export const CLAUDE_CALLBACK_PATH = '/callback'
+// Fallbacks only when discovery is unavailable or the model omits its limits.
 const CLAUDE_CONTEXT_WINDOW = 200_000
 const CLAUDE_DEFAULT_MAX_TOKENS = 32_000
 /** Refresh when the access token has less than this much life left. */
@@ -98,9 +102,11 @@ export const claudeRateLimitReset: RateLimitResetReader = (response, body, now) 
 /**
  * The subscription endpoint only serves requests presenting as Claude Code,
  * so these headers impersonate the CLI; the harness attribution user-agent
- * cannot be sent here (one user-agent slot, and the CLI's wins).
+ * cannot be sent here (one user-agent slot, and the CLI's wins). The endpoint
+ * also gates new models on the CLI version, so the version normally comes
+ * from npm (`ClaudeCliVersionCache`); this is only the offline floor.
  */
-export const CLAUDE_CLI_FALLBACK_VERSION = '2.1.263'
+export const CLAUDE_CLI_FALLBACK_VERSION = '2.1.283'
 
 /**
  * Candidate invocations, in order of preference. Windows npm installs expose
@@ -137,16 +143,32 @@ export function detectClaudeVersion(): string {
   return CLAUDE_CLI_FALLBACK_VERSION
 }
 
-// Lazy + memoized: detectClaudeVersion() shells out to `claude --version`,
-// so this must not run at module-evaluation time (it would fire for every
-// consumer of this module regardless of whether Claude is a configured
-// provider). Computed on first use of getClaudeCliUserAgent() instead.
-let claudeCliUserAgent: string | undefined
-function getClaudeCliUserAgent(): string {
-  if (claudeCliUserAgent === undefined) {
-    claudeCliUserAgent = `claude-cli/${detectClaudeVersion()} (external, cli)`
-  }
-  return claudeCliUserAgent
+/**
+ * The lowest version to present: the local CLI or the bundled fallback,
+ * whichever is newer. An outdated local install must not pin requests to a
+ * version the endpoint already rejects for new models.
+ * @param detect - local CLI probe (injectable for tests).
+ */
+export function claudeCliVersionFloor(detect: () => string = detectClaudeVersion): CliVersion {
+  const local = detect()
+  return compareVersions(local, CLAUDE_CLI_FALLBACK_VERSION) > 0
+    ? { version: local, source: 'local' }
+    : { version: CLAUDE_CLI_FALLBACK_VERSION, source: 'fallback' }
+}
+
+/** The User-Agent Claude Code sends at `version`. */
+export function claudeCliUserAgent(version: string): string {
+  return `claude-cli/${version} (external, cli)`
+}
+
+// Lazy + memoized: the floor shells out to `claude --version`, so this must
+// not run at module-evaluation time (it would fire for every consumer of this
+// module regardless of whether Claude is a configured provider). Used when no
+// npm-backed resolver is wired in.
+let localCliVersion: string | undefined
+async function localClaudeCliVersion(): Promise<string> {
+  localCliVersion ??= claudeCliVersionFloor().version
+  return localCliVersion
 }
 export const CLAUDE_BETA_FALLBACK = [
   'claude-code-20250219',
@@ -362,20 +384,23 @@ function claudeLimitsWindows(value: unknown): UsageWindow[] {
  * @param session - the stored session (used as-is; never refreshed here).
  * @param fetchFn - fetch implementation (injectable for tests).
  * @param signal - caller cancellation from the RPC transport.
+ * @param cliVersion - resolves the Claude Code version to present; defaults to the local floor.
  * @returns the mapped usage snapshot.
  */
 export async function fetchClaudeUsage(
   session: ClaudeSession,
   fetchFn: FetchFn = proxiedFetch,
   signal?: AbortSignal,
+  cliVersion: () => Promise<string> = localClaudeCliVersion,
 ): Promise<ProviderUsage> {
+  const userAgent = claudeCliUserAgent(await cliVersion())
   const response = await fetchFn(CLAUDE_USAGE_URL, {
     headers: {
       'authorization': `Bearer ${session.accessToken}`,
       'anthropic-beta': 'oauth-2025-04-20',
       // Unrecognized clients are aggressively rate-limited on this endpoint,
       // so it presents as the CLI like every other subscription request.
-      'user-agent': getClaudeCliUserAgent(),
+      'user-agent': userAgent,
       'accept': 'application/json',
     },
     ...signal === undefined ? {} : { signal },
@@ -395,14 +420,6 @@ export async function fetchClaudeUsage(
     if (window !== undefined) windows.push(window)
   }
   return { supported: true, windows }
-}
-
-/** One entry of the claude models API catalog. */
-interface ClaudeCatalogModel {
-  id?: string
-  display_name?: string
-  max_input_tokens?: number
-  capabilities?: ClaudeModelCapabilities
 }
 
 interface ClaudeModelCapabilities {
@@ -441,43 +458,63 @@ function claudeReasoning(capabilities: ClaudeModelCapabilities | undefined): Dis
   return efforts.length > 0 ? { efforts } : undefined
 }
 
-/** Fetch the live model catalog from the subscription endpoint. `signal` cancels the request. */
+/** One entry of the `/v1/models` response; only the fields the plugin reads. */
+interface ClaudeWireModel {
+  id?: string
+  display_name?: string
+  capabilities?: ClaudeModelCapabilities
+  /** Advertised input context size in tokens. */
+  max_input_tokens?: number
+  /** Advertised per-request output ceiling in tokens. */
+  max_tokens?: number
+}
+
+/** A token limit the endpoint disclosed, or undefined when absent or malformed. */
+function positiveTokenCount(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined
+}
+
+/**
+ * Fetch the live model catalog from the subscription endpoint. `signal`
+ * cancels the request; `cliVersion` resolves the Claude Code version to
+ * present (defaults to the local floor).
+ */
 export async function fetchClaudeModels(
   session: ClaudeSession,
   fetchFn: FetchFn = proxiedFetch,
   signal?: AbortSignal,
+  cliVersion: () => Promise<string> = localClaudeCliVersion,
 ): Promise<DiscoveredModel[]> {
+  const userAgent = claudeCliUserAgent(await cliVersion())
   const response = await fetchFn(CLAUDE_MODELS_URL, {
     headers: {
       'authorization': `Bearer ${session.accessToken}`,
       'anthropic-version': '2023-06-01',
-      'user-agent': getClaudeCliUserAgent(),
+      'user-agent': userAgent,
       'anthropic-dangerous-direct-browser-access': 'true',
       'accept': 'application/json',
     },
     ...signal === undefined ? {} : { signal },
   })
   if (!response.ok) throw await httpLlmError(response, 'claude models API')
-  const payload = await response.json() as {
-    data?: Array<ClaudeCatalogModel>
-  }
+  const payload = await response.json() as { data?: ClaudeWireModel[] }
   if (!Array.isArray(payload.data)) {
     throw new Error('claude models API returned an invalid catalog')
   }
   const models: DiscoveredModel[] = payload.data
-    .filter((m): m is ClaudeCatalogModel & { id: string } => typeof m.id === 'string')
+    .filter((m): m is ClaudeWireModel & { id: string } => typeof m.id === 'string')
     .map((m) => {
       const thinkingType = claudeThinkingType(m.capabilities)
       const reasoning = claudeReasoning(m.capabilities)
-      // The catalog advertises each model's input ceiling; without it every
-      // model falls back to the built-in default window.
-      const contextWindow = Number.isInteger(m.max_input_tokens) && (m.max_input_tokens ?? 0) > 0
-        ? m.max_input_tokens
-        : undefined
+      // The endpoint advertises each model's limits; carrying them through keeps
+      // the route current for models newer than the bundled catalog (#101).
+      const contextWindow = positiveTokenCount(m.max_input_tokens)
+      const maxOutputTokens = positiveTokenCount(m.max_tokens)
       return {
         id: m.id,
         name: m.display_name ?? m.id,
         ...contextWindow === undefined ? {} : { contextWindow },
+        ...maxOutputTokens === undefined ? {} : { maxOutputTokens },
         ...thinkingType === undefined ? {} : { thinkingType },
         ...reasoning === undefined ? {} : { reasoning },
       }
@@ -486,6 +523,16 @@ export async function fetchClaudeModels(
     throw new Error('claude models API returned an empty catalog')
   }
   return models
+}
+
+/**
+ * The output cap for one model: configuration may lower the default, but never
+ * exceeds a server-advertised ceiling; the built-in constant is the last resort.
+ */
+function claudeMaxTokens(configured: ModelEntry | undefined, disc: DiscoveredModel | undefined): number {
+  const outputLimit = disc?.maxOutputTokens
+  const preferred = configured?.maxTokens ?? outputLimit ?? CLAUDE_DEFAULT_MAX_TOKENS
+  return outputLimit === undefined ? preferred : Math.min(preferred, outputLimit)
 }
 
 /** Constructor dependencies for {@link ClaudeAdapter}. */
@@ -505,13 +552,41 @@ export interface ClaudeAdapterOptions {
   resolveAttachments?: () => AttachmentStore | undefined
   /** Durable catalog store seeding capability metadata across restarts. */
   catalogStore?: CatalogPersistence
+  onCatalogChanged?: () => void
+  accountCatalogStore?: (account: string) => CatalogPersistence
   /**
    * Per-model default reasoning effort override (the Settings page's picker).
    * Returns the user-configured default for one model, or undefined to follow
    * the provider's own default.
    */
   defaultEffortOf?: (model: string) => string | undefined
+  /** Resolves the Claude Code version to present (npm-backed); absent means the local floor. */
+  resolveCliVersion?: () => Promise<string>
+  /** Lifetime of the request's cache breakpoints; absent means Anthropic's five-minute default. */
+  promptCacheTtl?: PromptCacheTtl
+  /**
+   * The user's Settings-page choice, read per request so a save applies to
+   * the next turn without a restart; undefined falls back to `promptCacheTtl`.
+   */
+  promptCacheTtlOverride?: () => PromptCacheTtl | undefined
 }
+
+/**
+ * Anthropic rejects any image edge over 2000px once a request carries many
+ * images, and every later turn resends the history, so one oversized
+ * screenshot would fail the session for good (#110). Images are sent within
+ * this cap; 3.75MB encoded stays under the 5MB base64 per-image limit.
+ */
+const CLAUDE_IMAGE_LIMIT = { maxEdge: 2000, maxBytes: 3_750_000 }
+
+/**
+ * Inline image data a Claude request may carry, in base64 bytes. Every turn
+ * resends the history, so screenshots accumulate until the request passes the
+ * API's 32MB body limit and every later turn and compaction fails with HTTP
+ * 413 `request_too_large`. Past this budget the host offloads the oldest
+ * images to text and retries; the remaining 12MB holds prompts, tools, and text.
+ */
+export const CLAUDE_REQUEST_IMAGE_BUDGET = 20 * 1024 * 1024
 
 /** The Claude 4.5 family accepts image input. */
 const CLAUDE_MODALITIES: readonly ('text' | 'image')[] = ['text', 'image']
@@ -529,6 +604,10 @@ const CLAUDE_MODALITIES: readonly ('text' | 'image')[] = ['text', 'image']
  * @param maxTokens - the resolved output cap.
  * @param thinking - the thinking parameter, when the model takes one.
  * @param effort - the reasoning effort, when the model advertises efforts.
+ * @param cacheTtl - lifetime of every cache breakpoint; defaults to five minutes.
+ * Requests that carry a `purpose` (compaction, session titles) always use five
+ * minutes to preserve their existing auxiliary-request behavior. A five-minute
+ * mark can still read an entry a one-hour mark wrote.
  * @returns the JSON body to POST.
  */
 export function claudeRequestBody(
@@ -537,13 +616,15 @@ export function claudeRequestBody(
   maxTokens: number,
   thinking?: Record<string, unknown>,
   effort?: string,
+  cacheTtl?: PromptCacheTtl,
 ): Record<string, unknown> {
+  const ttl = options.purpose === undefined ? cacheTtl : undefined
   const anthropicMessages = toAnthropicMessages(messages)
-  markMessageCache(anthropicMessages)
+  markMessageCache(anthropicMessages, ttl)
   return {
     model: options.model,
     max_tokens: maxTokens,
-    system: toAnthropicSystem(options.system, messages),
+    system: toAnthropicSystem(options.system, messages, ttl),
     messages: anthropicMessages,
     ...options.tools !== undefined && options.tools.length > 0
       ? { tools: toAnthropicTools(options.tools) }
@@ -560,29 +641,43 @@ export class ClaudeAdapter extends LlmAdapter {
   private readonly catalog: ModelCatalogCache
   /** In-memory catalogs for non-default accounts (the persisted cache is the default's). */
   private readonly accountCatalogs = new Map<string, ModelCatalogCache>()
+  private accountCatalogsInvalidated = false
+  private readonly invalidatedAccounts = new Set<string>()
   /** Account whose snapshot currently lives in {@link catalog}; cleared on default change. */
   private catalogOwner: string | undefined
 
   constructor(private readonly options: ClaudeAdapterOptions) {
     super()
-    this.catalog = new ModelCatalogCache(options.catalogStore)
+    this.catalog = new ModelCatalogCache(options.catalogStore, undefined, options.onCatalogChanged)
   }
 
   private async fetchCatalog(account?: string, signal?: AbortSignal): Promise<DiscoveredModel[]> {
-    return fetchClaudeModels(await this.options.tokens.session(account), this.options.fetchFn, signal)
+    return fetchClaudeModels(
+      await this.options.tokens.session(account),
+      this.options.fetchFn,
+      signal,
+      this.options.resolveCliVersion,
+    )
   }
 
   /** Drop cached catalogs after login/logout so the next list does not reuse a stale plan. */
   clearAccountCatalog(account?: string): void {
-    if (account === undefined) this.accountCatalogs.clear()
-    else this.accountCatalogs.delete(account)
+    if (account === undefined) { this.accountCatalogsInvalidated = true; this.invalidatedAccounts.clear() }
+    else this.invalidatedAccounts.add(account)
+    if (account === undefined) {
+      for (const cache of this.accountCatalogs.values()) cache.invalidate()
+      this.accountCatalogs.clear()
+    } else {
+      this.accountCatalogs.get(account)?.invalidate()
+      this.accountCatalogs.delete(account)
+    }
     if (account === undefined || this.catalogOwner === account || this.catalogOwner === undefined) {
       this.catalogOwner = undefined
       this.catalog.invalidate()
     }
   }
 
-  /** Persisted cache for the default account; a throwaway cache for any other. */
+  /** Default and secondary accounts each seed their own persisted catalog. */
   private async catalogFor(account?: string): Promise<ModelCatalogCache> {
     const defaultKey = await this.options.tokens.defaultAccount()
     const key = account ?? defaultKey
@@ -595,7 +690,9 @@ export class ClaudeAdapter extends LlmAdapter {
     }
     let cache = this.accountCatalogs.get(key)
     if (cache === undefined) {
-      cache = new ModelCatalogCache()
+      cache = new ModelCatalogCache(this.options.accountCatalogStore?.(key), undefined, this.options.onCatalogChanged)
+      const invalidated = this.invalidatedAccounts.delete(key)
+      if (this.accountCatalogsInvalidated || invalidated) cache.invalidate()
       this.accountCatalogs.set(key, cache)
     }
     return cache
@@ -633,7 +730,7 @@ export class ClaudeAdapter extends LlmAdapter {
   }
 
   override async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
-    const own = await this.listOwnModels(provider)
+    const own = await this.listOwnModels(provider, undefined, undefined, true)
     const pool = this.options.pool?.()
     if (pool === undefined) return own
     const extra = await pool.modelsForProvider(provider as ProviderId)
@@ -643,13 +740,13 @@ export class ClaudeAdapter extends LlmAdapter {
   }
 
   /** The provider's own catalog: union of every account, or one account when named. */
-  async listOwnModels(provider: string, account?: string, signal?: AbortSignal): Promise<readonly LlmModelInfo[]> {
+  async listOwnModels(provider: string, account?: string, signal?: AbortSignal, preferCached = false): Promise<readonly LlmModelInfo[]> {
     if (account === undefined) {
       const accounts = (await this.options.tokens.list()).map(entry => entry.key)
       if (accounts.length === 0) return []
       return unionAccountCatalogs(
         accounts,
-        (key, accountSignal) => this.listOwnModels(provider, key, accountSignal),
+        (key, accountSignal) => this.listOwnModels(provider, key, accountSignal, preferCached),
         { timeoutMs: DISCOVERY_TIMEOUT_MS, ...signal === undefined ? {} : { signal } },
       )
     }
@@ -659,11 +756,11 @@ export class ClaudeAdapter extends LlmAdapter {
     if (!this.options.discovery) return this.staticModels(provider)
     const catalog = await this.catalogFor(account)
     try {
-      const models = await discoverOrRetryAuth(
+      const models = await catalog.get(() => discoverOrRetryAuth(
         force => this.options.tokens.session(account, force),
         catalog,
-        () => catalog.get(() => this.fetchCatalog(account, signal)),
-      )
+        () => this.fetchCatalog(account, signal),
+      ), preferCached)
       return models.map(model => ({
         provider,
         id: model.id,
@@ -701,7 +798,7 @@ export class ClaudeAdapter extends LlmAdapter {
       context: {
         contextWindow: disc?.contextWindow ?? configured?.contextWindow ?? CLAUDE_CONTEXT_WINDOW,
       },
-      defaultMaxTokens: configured?.maxTokens ?? CLAUDE_DEFAULT_MAX_TOKENS,
+      defaultMaxTokens: claudeMaxTokens(configured, disc),
       ...(reasoning === undefined ? {} : { reasoning }),
     }
   }
@@ -764,23 +861,36 @@ export class ClaudeAdapter extends LlmAdapter {
   }
 
   private async request(options: GenerateOptions, session: ClaudeSession, signal: AbortSignal): Promise<Response> {
-    const messages = await resolveImages(options.messages, this.options.resolveAttachments?.(), signal)
-    const maxTokens = options.maxTokens
-      ?? this.options.models.find(entry => entry.id === options.model)?.maxTokens
-      ?? CLAUDE_DEFAULT_MAX_TOKENS
+    const messages = await resolveImages(options.messages, this.options.resolveAttachments?.(), signal, CLAUDE_IMAGE_LIMIT)
+    if (hostSupportsImageOffload()) {
+      const offloadImages = requiredImageOffloadCount(messages, CLAUDE_REQUEST_IMAGE_BUDGET)
+      if (offloadImages > 0) {
+        // Older dsh-llm option types lack `offloadImages`; 0.2+ hosts read it.
+        throw new LlmError(
+          `claude request images exceed the ${CLAUDE_REQUEST_IMAGE_BUDGET}-byte base64 budget; `
+          + `${offloadImages} more oldest image(s) must be offloaded`,
+          IMAGE_OFFLOAD_REQUIRED,
+          { offloadImages } as ErrorOptions,
+        )
+      }
+    }
     const disc = await this.discovered(options.model)
+    const maxTokens = options.maxTokens
+      ?? claudeMaxTokens(this.options.models.find(entry => entry.id === options.model), disc)
     const thinking = this.thinkingParam(disc?.thinkingType, maxTokens)
     const effort = options.reasoningEffort !== undefined && disc?.reasoning !== undefined
       ? String(options.reasoningEffort)
       : undefined
-    const body = claudeRequestBody(options, messages, maxTokens, thinking, effort)
+    const cacheTtl = this.options.promptCacheTtlOverride?.() ?? this.options.promptCacheTtl
+    const body = claudeRequestBody(options, messages, maxTokens, thinking, effort, cacheTtl)
+    const cliVersion = await (this.options.resolveCliVersion ?? localClaudeCliVersion)()
     return proxiedFetch(CLAUDE_API_URL, {
       method: 'POST',
       headers: {
         'authorization': `Bearer ${session.accessToken}`,
         'anthropic-version': '2023-06-01',
         'anthropic-beta': CLAUDE_BETA_FLAGS,
-        'user-agent': getClaudeCliUserAgent(),
+        'user-agent': claudeCliUserAgent(cliVersion),
         'x-app': 'cli',
         'anthropic-dangerous-direct-browser-access': 'true',
         'accept': 'text/event-stream',

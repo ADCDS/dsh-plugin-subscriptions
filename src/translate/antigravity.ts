@@ -38,7 +38,7 @@ export interface AntigravityPart {
   thoughtSignature?: string
   inlineData?: { mimeType: string; data: string }
   functionCall?: { id?: string; name?: string; args?: unknown }
-  functionResponse?: { id: string; name: string; response: unknown }
+  functionResponse?: { id: string; name: string; response: Record<string, unknown> }
 }
 
 /** Full Antigravity request envelope. */
@@ -58,14 +58,27 @@ export interface AntigravityRequest {
   }
 }
 
-/** Flatten a harness tool result to the JSON value Antigravity receives. */
-function toolResultValue(block: ResolvedToolResultBlock): unknown {
+/**
+ * Normalize a harness tool result to the JSON object Antigravity's
+ * `FunctionResponse.response` field requires. That field maps to a singular
+ * protobuf `Struct`, so a bare array, string, number or boolean is rejected
+ * by the endpoint with "Proto field is not repeating, cannot start list".
+ * Only a non-array JSON object survives verbatim; every other JSON value is
+ * wrapped in the same "output" envelope the non-JSON path already uses --
+ * the shape other Cloud Code Assist clients send for every tool result.
+ */
+function toolResultValue(block: ResolvedToolResultBlock): Record<string, unknown> {
   const text = block.content.map(part => part.type === 'text' ? part.text : '').join('')
+  let parsed: unknown
   try {
-    return JSON.parse(text) as unknown
+    parsed = JSON.parse(text) as unknown
   } catch {
     return { output: text, ...block.isError === true ? { isError: true } : {} }
   }
+  if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    return { ...parsed as Record<string, unknown>, ...block.isError === true ? { isError: true } : {} }
+  }
+  return { output: parsed, ...block.isError === true ? { isError: true } : {} }
 }
 
 /** Safely read per-block replay metadata emitted by this adapter. */
@@ -99,6 +112,13 @@ export function toAntigravityTools(tools: readonly ToolSchema[], model = 'gemini
   }]
 }
 
+const SKIP_THOUGHT_SIGNATURE_VALIDATOR = 'skip_thought_signature_validator'
+
+/** Gemini 3 validates the first function call in every model tool-call step. */
+function requiresThoughtSignatures(model?: string): boolean {
+  return model !== undefined && /^gemini-3(?:[.-]|$)/i.test(model)
+}
+
 /**
  * Convert resolved harness messages into Gemini contents. Function response
  * names are recovered from prior tool calls because DSH correlates results by
@@ -112,9 +132,26 @@ export function toAntigravityContents(messages: readonly TranslatableMessage[], 
   const callNames = new Map<string, string>()
   for (const message of withToolResultImages(messages)) {
     if (message.role === 'system') continue
+    if (message.role === 'tool') {
+      const id = message.toolCallId ?? message.tool_call_id
+        ?? (message.source?.kind === 'tool' ? String(message.source.callId) : undefined)
+      if (id === undefined) throw new LlmError('tool result has no call id', 'INVALID_REQUEST')
+      const part: AntigravityPart = { functionResponse: {
+        id,
+        name: callNames.get(id) ?? '',
+        response: toolResultValue({ type: 'tool-result', toolCallId: ToolCallId(id), content: message.content,
+          ...message.isError === true ? { isError: true } : {},
+        }),
+      } }
+      const previous = out.at(-1)
+      if (previous?.role === 'user') previous.parts.push(part)
+      else out.push({ role: 'user', parts: [part] })
+      continue
+    }
     const role = message.role === 'assistant' ? 'model' as const : 'user' as const
     const metadata = replayBlocks(message, model)
     const parts: AntigravityPart[] = []
+    let sawFunctionCall = false
     for (let index = 0; index < message.content.length; index++) {
       const block = message.content[index]
       switch (block.type) {
@@ -143,12 +180,15 @@ export function toAntigravityContents(messages: readonly TranslatableMessage[], 
           } catch {
             args = {}
           }
+          const replaySignature = metadata[index]?.thoughtSignature
+          const thoughtSignature = replaySignature ?? (!sawFunctionCall && requiresThoughtSignatures(model)
+            ? SKIP_THOUGHT_SIGNATURE_VALIDATOR
+            : undefined)
           parts.push({
             functionCall: { id: String(block.id), name: block.name, args },
-            ...metadata[index]?.thoughtSignature === undefined
-              ? {}
-              : { thoughtSignature: metadata[index].thoughtSignature },
+            ...thoughtSignature === undefined ? {} : { thoughtSignature },
           })
+          sawFunctionCall = true
           break
         }
         case 'tool-result': {
