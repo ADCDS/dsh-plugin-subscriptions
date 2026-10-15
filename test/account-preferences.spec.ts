@@ -11,6 +11,7 @@ import { ProviderSettingsStore, validatePreferences } from '../src/provider-sett
 import { PoolAdapter } from '../src/providers/pool.js'
 import { PoolHealthRegistry } from '../src/providers/pool-health.js'
 import { PoolUsageTracker } from '../src/providers/pool-usage.js'
+import './keep-alive.js'
 
 class Raw extends LlmAdapter {
   calls: string[] = []
