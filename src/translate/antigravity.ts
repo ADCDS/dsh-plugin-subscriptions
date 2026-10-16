@@ -129,7 +129,7 @@ const SKIP_THOUGHT_SIGNATURE_VALIDATOR = 'skip_thought_signature_validator'
  * and 2.x never asked for one, and `gemini-<name>` without a version does not either.
  */
 function requiresThoughtSignatures(model?: string): boolean {
-  return model !== undefined && /^gemini-(?:[3-9]|[1-9]\d+)(?:[.-]|$)/i.test(model)
+  return model !== undefined && /^gemini-(?:[3-9]|[1-9]\d+)(?:[.-]|$)/i.test(model.trim())
 }
 
 /**

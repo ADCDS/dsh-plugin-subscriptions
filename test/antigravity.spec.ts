@@ -815,6 +815,29 @@ test('the placeholder follows the model version, not the block shape', () => {
   assert.equal(signatureFor('gemini-pro'), undefined)
 })
 
+test('the model match is case-insensitive and ignores surrounding space', () => {
+  const foreign = { kind: 'model' as const, provider: 'claude', model: 'claude-sonnet-4' }
+  const messages: TranslatableMessage[] = [
+    message('user', [{ type: 'text', text: 'inspect' }]),
+    message('assistant', [{ type: 'tool-call', id: ToolCallId('call-1'), name: 'bash', arguments: '{}' }], foreign),
+  ]
+  const signatureFor = (model: string) => {
+    const payload = toAntigravityRequest({ ...options([]), model }, messages, 'project-123')
+    const parts = payload.request.contents.find(content => content.role === 'model')?.parts ?? []
+    return parts.find(part => part.functionCall !== undefined)?.thoughtSignature
+  }
+  // Model ids arrive from a catalog, but nothing guarantees their casing — a case-sensitive
+  // match would silently drop the placeholder and bring the 400 back.
+  assert.equal(signatureFor('GEMINI-4-ARGON-LOW'), 'skip_thought_signature_validator')
+  assert.equal(signatureFor('Gemini-4-Pro'), 'skip_thought_signature_validator')
+  assert.equal(signatureFor('GEMINI-3-PRO-PREVIEW'), 'skip_thought_signature_validator')
+  assert.equal(signatureFor(' gemini-4-pro'), 'skip_thought_signature_validator')
+  assert.equal(signatureFor('gemini-4-pro '), 'skip_thought_signature_validator')
+  // The version boundary: `4x` is not a major version, and 2.x/1.x never asked for one.
+  assert.equal(signatureFor('gemini-4x'), undefined)
+  assert.equal(signatureFor('gemini-2.5-pro'), undefined)
+  assert.equal(signatureFor('GEMINI-2.5-PRO'), undefined)
+})
 test('a replay of this same model keeps its own signature instead of the placeholder', () => {
   const source = {
     kind: 'model' as const,
