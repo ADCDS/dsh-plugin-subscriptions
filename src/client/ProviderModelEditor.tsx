@@ -4,6 +4,8 @@ import type { ConnectionHandle } from '@deepseek-ai/dsh-api-remotes/client'
 import type { ProviderPreferences, SubscriptionTool } from '../provider-settings.js'
 import type { SubscriptionProvider } from './SubscriptionsSection.js'
 import { callSubscriptionsAuth } from './subscriptions-rpc.js'
+import type { AccountCatalogRow } from './account-preferences.js'
+import { modelEditorState, savedModelIds } from './model-filter.js'
 import type { SubscriptionsKey } from './locales.js'
 
 interface ModelRow {
@@ -19,6 +21,8 @@ interface Catalog {
   provider: SubscriptionProvider
   settings: ProviderPreferences
   models: ModelRow[]
+  /** One row per connected account; `unavailable` means its discovery failed. */
+  accounts: AccountCatalogRow[]
   tools: SubscriptionTool[]
 }
 interface Props {
@@ -121,8 +125,8 @@ export const ProviderModelEditor = forwardRef<ProviderModelEditorHandle, Props>(
 
   const allModels = catalog?.models ?? []
   const known = new Set(allModels.map(model => model.id))
-  const savedIds = new Set([...(draft.visibleModels ?? []), ...Object.keys(draft.modelDisplayNames ?? {})])
-  const missing = [...savedIds].filter(id => !known.has(id)).map(id => ({ id, name: id } as ModelRow))
+  const savedIds = savedModelIds(draft.visibleModels, draft.modelDisplayNames)
+  const missing = savedIds.filter(id => !known.has(id)).map(id => ({ id, name: id } as ModelRow))
   const customName = (id: string) => Object.hasOwn(draft.modelDisplayNames ?? {}, id) ? draft.modelDisplayNames![id] : ''
   const editName = (id: string, value: string) => {
     const names: Record<string, string> = Object.assign(Object.create(null), draft.modelDisplayNames)
@@ -131,6 +135,12 @@ export const ProviderModelEditor = forwardRef<ProviderModelEditorHandle, Props>(
     edit({ ...draft, modelDisplayNames: names })
   }
   const models = [...allModels, ...missing].filter(model => `${model.name} ${model.id} ${customName(model.id)}`.toLowerCase().includes(query.trim().toLowerCase()))
+  const editorState = modelEditorState({
+    discovered: allModels.length,
+    saved: missing.length,
+    matched: models.length,
+    accounts: catalog?.accounts ?? [],
+  })
   const selected = new Set(draft.visibleModels ?? allModels.map(model => model.id))
   return <div style={{ borderTop: border, marginTop: 12, paddingTop: 12 }}>
     <h3 style={{ margin: 0 }}>{t('modelsEdit')}</h3>
@@ -148,6 +158,7 @@ export const ProviderModelEditor = forwardRef<ProviderModelEditorHandle, Props>(
           else next.visibleModels = allModels.map(model => model.id)
           edit(next)
         }} /> {t('modelsAutomatic')}</label>
+        {editorState.listState === 'provider-empty' ? <p className="dsh-subscription-hint">{t(editorState.noticeKey)}</p> : <>
         <div style={actions}>
           <input style={{ flex: '1 1 180px' }} value={query} onChange={event => setQuery(event.target.value)}
             placeholder={t('modelDefaultsFilterPlaceholder')} aria-label={t('modelDefaultsFilterPlaceholder')} />
@@ -198,6 +209,7 @@ export const ProviderModelEditor = forwardRef<ProviderModelEditorHandle, Props>(
           </div>)}
           {models.length === 0 && <span>{t('modelDefaultsFilterEmpty', { query })}</span>}
         </div>
+        </>}
         {provider === 'codex' && <small>{t('modelsContextHint')}</small>}
         {catalog.tools.length > 0 && <div style={{ display: 'grid', gap: 8 }}>
           <strong>{t('modelsTools')}</strong>
