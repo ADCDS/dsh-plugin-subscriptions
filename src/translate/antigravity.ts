@@ -114,9 +114,22 @@ export function toAntigravityTools(tools: readonly ToolSchema[], model = 'gemini
 
 const SKIP_THOUGHT_SIGNATURE_VALIDATOR = 'skip_thought_signature_validator'
 
-/** Gemini 3 validates the first function call in every model tool-call step. */
+/**
+ * Whether this model validates thought signatures on replayed function calls.
+ *
+ * Gemini 3 introduced the requirement and Gemini 4 enforces it the same way: a session
+ * that replays tool calls made by another model (no provider signature to reuse) is
+ * rejected with `Function call is missing a thought_signature in functionCall parts`
+ * unless the first call of the step carries the placeholder (issue #148, reproduced on
+ * `gemini-4-argon-low` with a direct v1internal call: omitted → HTTP 400, placeholder →
+ * HTTP 200).
+ *
+ * Widening is the safe direction — an unnecessary placeholder is accepted, a missing
+ * signature is not — so this matches Gemini 3 and every later major version. Gemini 1.x
+ * and 2.x never asked for one, and `gemini-<name>` without a version does not either.
+ */
 function requiresThoughtSignatures(model?: string): boolean {
-  return model !== undefined && /^gemini-3(?:[.-]|$)/i.test(model)
+  return model !== undefined && /^gemini-(?:[3-9]|[1-9]\d+)(?:[.-]|$)/i.test(model)
 }
 
 /**
