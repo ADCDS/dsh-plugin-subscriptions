@@ -14,6 +14,15 @@ const session: CodexSession = {
   accessToken: 'secret', refreshToken: 'refresh', expiresAt: Date.now() + 60_000, accountId: 'acct-1',
 }
 
+/**
+ * DSH 0.2.1-rc.2 takes the runtime's provider overrides as `Volatile` refs.
+ * Both answering `undefined` means "no pinned provider, auto-select", which is
+ * the single-provider situation every case here sets up.
+ */
+function autoSelectConfig() {
+  return { searchProvider: { get: () => undefined }, fetchProvider: { get: () => undefined } }
+}
+
 function provider(fetchFn: typeof fetch, sessionFn = async () => session) {
   return new CodexWebSearchProvider({
     tokens: { session: sessionFn }, fetchFn, requestId: () => 'request-1', retryBaseMs: 0,
@@ -55,7 +64,7 @@ test('Codex Web Search sends the standalone contract and normalizes citations', 
 
 test('DSH WebRuntime caps Codex sources for the native web_search tool', async () => {
   const ctx = new Context()
-  const web = new WebRuntime(ctx)
+  const web = new WebRuntime(ctx, autoSelectConfig())
   web.registerSearchProvider(provider(async () => new Response(JSON.stringify({ output: 'ok', results: [
     { url: 'https://example.com/1' }, { url: 'https://example.com/2' },
   ] }))))
@@ -114,7 +123,7 @@ test('the Codex web_search switch drives provider availability, not the host too
 
 test('a disabled Codex provider releases the seam instead of holding it', async () => {
   const ctx = new Context()
-  const web = new WebRuntime(ctx)
+  const web = new WebRuntime(ctx, autoSelectConfig())
   let enabled = false
   web.registerSearchProvider(new CodexWebSearchProvider({
     tokens: { session: async () => session },
