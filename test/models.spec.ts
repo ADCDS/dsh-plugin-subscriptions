@@ -458,18 +458,20 @@ test('claude resolveModel serves discovered limits for models newer than the bun
     discovery: true,
     fetchFn: fakeFetch(CLAUDE_MODELS_PAYLOAD).fetchFn,
   })
-  // Not in the configured catalog: the endpoint's numbers win over the 200k/32k fallbacks.
+  // Not in the configured catalog: the endpoint's numbers win over the fallbacks.
   const fresh = await claude.resolveModel('claude', 'claude-opus-5-5')
   assert.equal(fresh.context?.contextWindow, 1_000_000)
   assert.equal(fresh.defaultMaxTokens, 128_000)
-  // Discovered but silent on limits: the fallbacks still apply.
+  // Discovered but silent on limits: the current generation's fallbacks apply.
+  // The endpoint lists the live catalog without limit fields, so this is the
+  // path every real model takes today.
   const bare = await claude.resolveModel('claude', 'claude-bare')
-  assert.equal(bare.context?.contextWindow, 200_000)
-  assert.equal(bare.defaultMaxTokens, 32_000)
-  // Unknown to discovery and configuration alike: unchanged behaviour.
+  assert.equal(bare.context?.contextWindow, 1_000_000)
+  assert.equal(bare.defaultMaxTokens, 128_000)
+  // Unknown to discovery and configuration alike: the same fallbacks.
   const unknown = await claude.resolveModel('claude', 'claude-unknown')
-  assert.equal(unknown.context?.contextWindow, 200_000)
-  assert.equal(unknown.defaultMaxTokens, 32_000)
+  assert.equal(unknown.context?.contextWindow, 1_000_000)
+  assert.equal(unknown.defaultMaxTokens, 128_000)
 })
 
 test('claude configured output cap may lower but never exceed the discovered ceiling', async () => {
