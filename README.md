@@ -86,7 +86,9 @@ Image generation and editing share same-provider account scheduling: try the def
 
 ### DSH compatibility
 
-Version `0.9.7` added support for DSH `0.2.0-rc.2`, and this branch extends it to `0.2.1-alpha.2`, `0.2.1-alpha.3` and `0.2.1-rc.2`, with development dependencies pinned to the newest of them. It handles request-only messages, first-class tool results, preparing tool views, and offloaded image placeholders while retaining legacy history translation. `0.2.1-rc.2` additionally requires tool arguments on every call head and takes the web runtime's provider overrides as `Volatile` refs. Other `0.2` prereleases are not implicitly allowed.
+Version `0.9.7` added support for DSH `0.2.0-rc.2`; DSH `0.2.1-alpha.2`, `0.2.1-alpha.3` and `0.2.1-rc.2` are supported as well, with development dependencies pinned to `0.2.1-rc.2`. It handles request-only messages, first-class tool results, preparing tool views, and offloaded image placeholders while retaining legacy history translation. `0.2.1-rc.2` additionally requires tool arguments on every call head and takes the web runtime's provider overrides as `Volatile` refs. Other `0.2` prereleases are not implicitly allowed.
+
+DSH's load-time check reads only the `@deepseek-ai/dsh` and `@deepseek-ai/dsh-*` peers. The `@deepseek-ai/cordis` and `@deepseek-ai/schemastery` peers keep their `^4.0.1` / `^3.18.1` floors and also list the `4.0.5-alpha` / `3.18.5-alpha` builds bundled with DSH `0.2.1-alpha.2` and `0.2.1-alpha.3`, because a caret range does not match prereleases under npm semver.
 
 The current release supports the published DSH `0.1.1-rc.2`, `0.1.2-alpha`/`rc`, `0.1.3-alpha`, `0.1.5-alpha`/`rc`, and `0.1.7-rc` lines, including `0.1.5-rc.2` and `0.1.7-rc.2`. The `0.1.5-alpha.1` peer-range anchor intentionally covers the later `0.1.5-alpha`, `0.1.5-rc`, and stable `0.1.5` builds under npm semver rules; the `0.1.7-rc.1` anchor likewise covers the later `0.1.7-rc` and stable `0.1.7` builds. DSH `0.1.6-alpha` and `0.1.7-alpha` are not included until they have been separately verified.
 
