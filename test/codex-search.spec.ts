@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { WebRuntime } from '@deepseek-ai/dsh-web'
+import type { WebRuntimeConfig } from '@deepseek-ai/dsh-web'
 import { Context } from '@deepseek-ai/cordis'
 import {
   CODEX_SEARCH_MODEL,
@@ -16,10 +17,11 @@ const session: CodexSession = {
 
 /**
  * DSH 0.2.1-rc.2 takes the runtime's provider overrides as `Volatile` refs.
- * Both answering `undefined` means "no pinned provider, auto-select", which is
- * the single-provider situation every case here sets up.
+ * Both answering `undefined` pins no provider, so selection falls to the seam's
+ * auto-select rule (one usable provider wins, several are ambiguous), which is
+ * the behaviour these cases exercise.
  */
-function autoSelectConfig() {
+function autoSelectConfig(): WebRuntimeConfig {
   return { searchProvider: { get: () => undefined }, fetchProvider: { get: () => undefined } }
 }
 
