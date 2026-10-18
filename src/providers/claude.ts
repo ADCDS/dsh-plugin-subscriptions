@@ -66,13 +66,8 @@ export const CLAUDE_MODELS_URL = 'https://api.anthropic.com/v1/models?beta=true'
 export const CLAUDE_SCOPE = 'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload'
 export const CLAUDE_CALLBACK_PATH = '/callback'
 // Fallbacks only when discovery is unavailable or the model omits its limits.
-// The endpoint currently lists the current models without any limit fields, so
-// these fallbacks are what the whole catalog resolves to in practice: 1M in,
-// 128K out is the current generation's real capacity. A model known to be
-// narrower keeps its own numbers in the built-in catalog below, which is read
-// first.
-const CLAUDE_CONTEXT_WINDOW = 1_000_000
-const CLAUDE_DEFAULT_MAX_TOKENS = 128_000
+const CLAUDE_CONTEXT_WINDOW = 200_000
+const CLAUDE_DEFAULT_MAX_TOKENS = 32_000
 /** Refresh when the access token has less than this much life left. */
 export const CLAUDE_PREEMPT_MS = 5 * 60_000
 
