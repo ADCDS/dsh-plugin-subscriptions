@@ -1014,10 +1014,12 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
                   {t('addAccount')}
                 </button>
               )}
-              <button type="button" aria-haspopup="dialog"
+              {/* 与同排其它按钮一致：登录/取消进行中不开第二个写配置的弹窗。 */}
+              {!busy && <button type="button" aria-haspopup="dialog"
                 onClick={() => setManagedProvider({ id, name })}>
                 {t('accountsManage')}
-              </button>
+              </button>}
+
               {busy && (
                 <button type="button" onClick={() => { void cancel(id) }}>
                   {t('cancel')}
