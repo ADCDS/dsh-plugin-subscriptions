@@ -114,6 +114,33 @@ try {
   assert.equal(await page.evaluate(() => window.settings.displayName), undefined)
   assert.equal(await page.evaluate(() => window.settings.modelDisplayNames.alpha), undefined)
   assert.equal(await page.evaluate(() => window.settings.accounts.personal.alias), 'Merged')
+  // Subagent defaults share the existing Save/Cancel flow and survive unavailable capabilities.
+  await open()
+  const speed = page.getByLabel('Alpha Subagent default speed', { exact: true })
+  assert.equal(await speed.inputValue(), 'standard')
+  assert.equal(await page.getByLabel('Beta Subagent default speed', { exact: true }).count(), 0)
+  await speed.selectOption('fast')
+  await page.getByRole('button', { name: 'Cancel', exact: true }).click()
+  await open()
+  assert.equal(await speed.inputValue(), 'standard')
+  await speed.selectOption('fast')
+  await page.evaluate(() => { window.failSave = true })
+  await page.getByRole('button', { name: 'Save changes', exact: true }).click()
+  await page.getByRole('alert').filter({ hasText: 'Simulated save failure' }).waitFor()
+  assert.equal(await speed.inputValue(), 'fast')
+  await page.evaluate(() => { window.failSave = false })
+  await page.getByRole('button', { name: 'Save changes', exact: true }).click()
+  await page.getByRole('dialog').waitFor({ state: 'detached' })
+  assert.deepEqual(await page.evaluate(() => window.settings.subagentSpeeds), { alpha: 'fast' })
+  await page.evaluate(() => { window.supportsFast = false })
+  await open()
+  assert.equal(await speed.inputValue(), 'fast', 'saved preference survives a catalog capability change')
+  assert.equal(await speed.locator('option[value="fast"]').getAttribute('disabled'), '')
+  await speed.selectOption('standard')
+  await page.getByRole('button', { name: 'Save changes', exact: true }).click()
+  await page.getByRole('dialog').waitFor({ state: 'detached' })
+  assert.deepEqual(await page.evaluate(() => window.settings.subagentSpeeds), { alpha: 'standard' })
+  await page.evaluate(() => { window.supportsFast = true })
   await open()
   await personal.locator('summary').click()
   await mkdir('output', { recursive: true })
@@ -135,7 +162,7 @@ try {
   await page.getByRole('dialog').waitFor({ state: 'detached' })
   await page.evaluate(() => {
     window.preview = true
-    window.settings = { accounts: {
+    window.settings = { subagentSpeeds: { alpha: 'fast' }, accounts: {
       personal: { alias: '个人账号', poolEnabled: true, independentEntry: false },
       work: { alias: '工作专用', poolEnabled: false, independentEntry: true, poolModels: ['gpt-5.4'] },
     } }
@@ -144,6 +171,14 @@ try {
   await open()
   await personal.locator('summary').click()
   await page.screenshot({ path: 'output/account-manager-preview.png' })
+  const chineseSpeed = page.getByLabel('Alpha 子代理默认速度', { exact: true })
+  await chineseSpeed.scrollIntoViewIfNeeded()
+  assert.equal(await chineseSpeed.inputValue(), 'fast')
+  await page.screenshot({ path: 'output/subagent-speed-desktop.png' })
+  await page.setViewportSize({ width: 360, height: 720 })
+  await chineseSpeed.scrollIntoViewIfNeeded()
+  assert.equal(await page.getByRole('dialog').evaluate(el => el.scrollWidth <= el.clientWidth), true)
+  await page.screenshot({ path: 'output/subagent-speed-mobile.png' })
   assert.deepEqual(errors, [])
-  console.log('Account-manager browser checks passed: defaults, strict selection, failed-save retry, fresh-settings merge, Escape/focus containment and restoration, responsive width.')
+  console.log('Account-manager browser checks passed: defaults, strict selection, failed-save retry, fresh-settings merge, independent subagent speed, capability loss, bilingual copy, Escape/focus containment and restoration, responsive width.')
 } finally { await browser.close() }
