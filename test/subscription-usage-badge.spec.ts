@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { registerHooks } from 'node:module'
+import { PartialArguments } from '@deepseek-ai/dsh-util-values'
 // The host primitives ship CSS modules; Node needs only their empty class map
 // for these pure-logic / server-render tests, not a browser stylesheet loader.
 const css = registerHooks({ load(url, context, nextLoad) {
@@ -21,7 +22,12 @@ import { en, zh } from '../src/client/locales.js'
 
 test('media tool views render the preparing phase before arguments are available', () => {
   for (const [Component, name] of [[ImageGenerateToolview, 'image_generate'], [VideoGenerateToolview, 'video_generate']] as const) {
-    const block = { phase: 'preparing' as const, callId: 'media-call', name, turn: 0, step: 0, time: 0, subCalls: [] }
+    // `args` is required on every tool-call head since DSH 0.2.1-rc.2; EMPTY is
+    // the honest view for a call whose arguments have not arrived yet.
+    const block = {
+      phase: 'preparing' as const, callId: 'media-call', name, turn: 0, step: 0, time: 0,
+      subCalls: [], args: PartialArguments.EMPTY,
+    }
     const html = renderToStaticMarkup(createElement(Component, { block }))
     assert.ok(html.includes(name))
   }
