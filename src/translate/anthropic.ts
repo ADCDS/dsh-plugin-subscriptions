@@ -325,6 +325,7 @@ export interface AnthropicStreamEvent {
   type: string
   index?: number
   message?: {
+    id?: string
     usage?: {
       input_tokens?: number
       output_tokens?: number
@@ -404,6 +405,9 @@ export class AnthropicStreamTranslator {
   private pendingUsage: { inputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number } | undefined
   private outputTokens: number | undefined
   private stopReason: 'stop' | 'tool-calls' | 'max-tokens' = 'stop'
+  /** The wire `stop_reason`, kept verbatim so an empty completion can say why it stopped. */
+  private wireStopReason: string | undefined
+  private messageId: string | undefined
   private usageEmitted = false
   /** Set once `message_stop` produced the terminal finish chunk. */
   terminated = false
@@ -420,6 +424,21 @@ export class AnthropicStreamTranslator {
     this.sawAnyBlock = true
     chunks.push({ type: 'block-start', index: block.index, blockType: kind })
     return block
+  }
+
+  /**
+   * The failure text for a completed message with no content block. It names
+   * the wire stop reason (an unrecognized one such as `refusal` lands here as
+   * well), the output tokens the message reported, and its id, so an empty
+   * reply can be told apart from a refusal or a stream that never stopped.
+   */
+  private emptyResponseMessage(): string {
+    const facts = [
+      `stop_reason ${this.wireStopReason ?? 'not sent'}`,
+      `${String(this.outputTokens ?? 0)} output tokens`,
+      ...this.messageId === undefined ? [] : [this.messageId],
+    ]
+    return `model returned a completed response with no content (${facts.join(', ')})`
   }
 
   private emitUsage(chunks: StreamChunk[]): void {
@@ -448,6 +467,7 @@ export class AnthropicStreamTranslator {
     const chunks: StreamChunk[] = []
     switch (event.type) {
       case 'message_start': {
+        if (typeof event.message?.id === 'string' && event.message.id.length > 0) this.messageId = event.message.id
         const usage = event.message?.usage
         if (usage !== undefined) {
           this.pendingUsage = {
@@ -529,6 +549,7 @@ export class AnthropicStreamTranslator {
       }
       case 'message_delta': {
         if (event.usage?.output_tokens !== undefined) this.outputTokens = event.usage.output_tokens
+        if (typeof event.delta?.stop_reason === 'string') this.wireStopReason = event.delta.stop_reason
         switch (event.delta?.stop_reason) {
           case 'end_turn':
           case 'stop_sequence':
@@ -557,7 +578,7 @@ export class AnthropicStreamTranslator {
             type: 'finish',
             reason: {
               kind: 'error',
-              failure: { message: 'model returned a completed response with no content', code: EMPTY_RESPONSE_CODE },
+              failure: { message: this.emptyResponseMessage(), code: EMPTY_RESPONSE_CODE },
             },
           })
         } else {
