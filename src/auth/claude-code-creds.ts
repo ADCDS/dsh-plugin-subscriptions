@@ -178,7 +178,9 @@ export function writeBackClaudeCodeCredentials(next: ClaudeSession, expectedPrio
  * refresh back to that store so every consumer of the account stays synced.
  * @param session - the session TokenManager wants refreshed.
  * @param doRefresh - the actual OAuth refresh-token grant (network call).
- * @returns the freshest available session.
+ * @returns the freshest available session, still marked keychain-bound: the
+ *   store replaces a session on save, so a result without the flag would stop
+ *   the account syncing after its first refresh.
  */
 export async function refreshClaudeSynced(
   session: ClaudeSession,
@@ -186,8 +188,8 @@ export async function refreshClaudeSynced(
 ): Promise<ClaudeSession> {
   const fromSource = readClaudeCodeCredentials()
   const base = fromSource !== undefined && fromSource.accessToken !== session.accessToken ? fromSource : session
-  if (base.expiresAt > Date.now() + 60_000) return base
+  if (base.expiresAt > Date.now() + 60_000) return { ...base, keychainBound: true }
   const next = await doRefresh(base)
   writeBackClaudeCodeCredentials(next, base.accessToken)
-  return next
+  return { ...next, keychainBound: true }
 }

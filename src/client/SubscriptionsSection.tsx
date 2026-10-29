@@ -646,7 +646,7 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
     setUsageErrors(prev => dropStale(prev, live))
   }, [statuses, usages, usageErrors, loadUsage])
 
-  const login = useCallback(async (provider: SubscriptionProvider, method?: 'oauth' | 'keychain'): Promise<void> => {
+  const login = useCallback(async (provider: SubscriptionProvider, method?: 'oauth' | 'keychain' | 'cli'): Promise<void> => {
     if (rpc === undefined) return
     setProviderError(provider, undefined)
     try {
@@ -655,7 +655,7 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
         ...method === undefined ? {} : { method },
       })
       if (typeof response.authorizeUrl === 'string' && response.authorizeUrl === '') {
-        // Instant login (e.g. imported from Claude Code credentials)
+        // Instant login (imported from Claude Code or Codex CLI credentials)
         await refresh()
         return
       }
@@ -1006,6 +1006,11 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
                   {t('login')}
                 </button>
               )}
+              {!busy && accounts.length === 0 && id === 'codex' && (
+                <button type="button" onClick={() => { void login(id, 'cli') }}>
+                  {t('addAccountCodexCli')}
+                </button>
+              )}
               {!busy && accounts.length > 0 && id === 'claude' && (
                 <>
                   <button type="button" onClick={() => { void login(id, 'oauth') }}>
@@ -1016,7 +1021,17 @@ export function SubscriptionsSection(props: SubscriptionsSectionProps) {
                   </button>
                 </>
               )}
-              {!busy && accounts.length > 0 && id !== 'claude' && (
+              {!busy && accounts.length > 0 && id === 'codex' && (
+                <>
+                  <button type="button" onClick={() => { void login(id, 'oauth') }}>
+                    {t('addAccountOAuth')}
+                  </button>
+                  <button type="button" onClick={() => { void login(id, 'cli') }}>
+                    {t('addAccountCodexCli')}
+                  </button>
+                </>
+              )}
+              {!busy && accounts.length > 0 && id !== 'claude' && id !== 'codex' && (
                 <button type="button" onClick={() => { void login(id) }}>
                   {t('addAccount')}
                 </button>

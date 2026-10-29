@@ -110,8 +110,11 @@ export interface ProviderStatus {
   clientVersion?: CliVersion
 }
 
-/** How a Claude login should acquire credentials (other providers ignore it). */
-export type LoginMethod = 'oauth' | 'keychain'
+/**
+ * How a login should acquire credentials: `keychain` imports Claude Code's
+ * session, `cli` imports the Codex CLI's, `oauth` forces the browser flow.
+ */
+export type LoginMethod = 'oauth' | 'keychain' | 'cli'
 
 /** Proxy config operations behind the `proxyGet/proxySet/proxyTest` endpoints. */
 export interface ProxyConfigController {
@@ -360,15 +363,23 @@ function readModelDefaultInput(payload: unknown): { provider: ProviderId; model:
   }
 }
 
-/** Validate the optional Claude login method. */
+/** Validate the optional Claude or Codex login method. */
 function readLoginMethod(payload: unknown, provider: ProviderId): LoginMethod | undefined {
   const method = (payload as Record<string, unknown>).method
   if (method === undefined) return undefined
-  if (provider !== 'claude') throw new BadRequest('payload.method is only valid for claude')
-  if (method !== 'oauth' && method !== 'keychain') {
-    throw new BadRequest('payload.method must be "oauth" or "keychain"')
+  if (provider === 'claude') {
+    if (method !== 'oauth' && method !== 'keychain') {
+      throw new BadRequest('payload.method must be "oauth" or "keychain"')
+    }
+    return method
   }
-  return method
+  if (provider === 'codex') {
+    if (method !== 'oauth' && method !== 'cli') {
+      throw new BadRequest('payload.method must be "oauth" or "cli"')
+    }
+    return method
+  }
+  throw new BadRequest('payload.method is only valid for claude and codex')
 }
 
 /** Validate the `setSpeed` endpoint's tier. */
