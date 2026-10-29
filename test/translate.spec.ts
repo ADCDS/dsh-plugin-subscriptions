@@ -812,6 +812,45 @@ test('Anthropic translator: an empty completion says why it stopped', () => {
     message: 'model returned a completed response with no content (stop_reason not sent, 0 output tokens, msg_456)',
     code: 'EMPTY_RESPONSE',
   })
+  // Content blocks the translator does not render are named, so a reply made only of them is recognizable.
+  const unrendered = drain(new AnthropicStreamTranslator(), [
+    { type: 'message_start', message: { id: 'msg_789', usage: { input_tokens: 5 } } },
+    { type: 'content_block_start', index: 0, content_block: { type: 'compaction' } },
+    { type: 'content_block_stop', index: 0 },
+    { type: 'message_delta', delta: { stop_reason: 'compaction' }, usage: { output_tokens: 40 } },
+    { type: 'message_stop' },
+  ])
+  assert.deepEqual(failureOf(unrendered), {
+    message: 'model returned a completed response with no content (stop_reason compaction, 40 output tokens, msg_789, unrendered blocks: compaction)',
+    code: 'EMPTY_RESPONSE',
+  })
+})
+
+test('Anthropic translator: a reply cut off by the context window is an overflow, not an empty reply', () => {
+  const failureOf = (chunks: StreamChunk[]): unknown => {
+    const last = chunks.at(-1)
+    return last?.type === 'finish' && last.reason.kind === 'error' ? last.reason.failure : undefined
+  }
+  // Nothing fit: the host compacts and retries on CONTEXT_WINDOW_EXCEEDED.
+  const overflow = drain(new AnthropicStreamTranslator(), [
+    { type: 'message_start', message: { id: 'msg_full', usage: { input_tokens: 990_000 } } },
+    { type: 'message_delta', delta: { stop_reason: 'model_context_window_exceeded' }, usage: { output_tokens: 0 } },
+    { type: 'message_stop' },
+  ])
+  assert.deepEqual(failureOf(overflow), {
+    message: 'the conversation filled the model\'s context window before it produced any output (stop_reason model_context_window_exceeded, 0 output tokens, msg_full)',
+    code: 'CONTEXT_WINDOW_EXCEEDED',
+  })
+  // Partial output before the window filled reads like a length stop.
+  const partial = drain(new AnthropicStreamTranslator(), [
+    { type: 'message_start', message: { usage: { input_tokens: 990_000 } } },
+    { type: 'content_block_start', index: 0, content_block: { type: 'text' } },
+    { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'partial' } },
+    { type: 'content_block_stop', index: 0 },
+    { type: 'message_delta', delta: { stop_reason: 'model_context_window_exceeded' }, usage: { output_tokens: 1 } },
+    { type: 'message_stop' },
+  ])
+  assert.deepEqual(partial.at(-1), { type: 'finish', reason: { kind: 'max-tokens' } })
 })
 
 test('Anthropic translator: error event mapping', () => {

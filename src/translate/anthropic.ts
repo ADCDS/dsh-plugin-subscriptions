@@ -407,6 +407,10 @@ export class AnthropicStreamTranslator {
   private stopReason: 'stop' | 'tool-calls' | 'max-tokens' = 'stop'
   /** The wire `stop_reason`, kept verbatim so an empty completion can say why it stopped. */
   private wireStopReason: string | undefined
+  /** Set by `model_context_window_exceeded`: the input plus output cap overran the window. */
+  private contextExceeded = false
+  /** Content block types this translator does not render, named when a reply comes back empty. */
+  private skippedBlockTypes = new Set<string>()
   private messageId: string | undefined
   private usageEmitted = false
   /** Set once `message_stop` produced the terminal finish chunk. */
@@ -433,12 +437,18 @@ export class AnthropicStreamTranslator {
    * reply can be told apart from a refusal or a stream that never stopped.
    */
   private emptyResponseMessage(): string {
-    const facts = [
+    const facts = this.responseFacts()
+    if (this.skippedBlockTypes.size > 0) facts.push(`unrendered blocks: ${[...this.skippedBlockTypes].join(', ')}`)
+    return `model returned a completed response with no content (${facts.join(', ')})`
+  }
+
+  /** The stop reason, output tokens and message id a terminal failure names. */
+  private responseFacts(): string[] {
+    return [
       `stop_reason ${this.wireStopReason ?? 'not sent'}`,
       `${String(this.outputTokens ?? 0)} output tokens`,
       ...this.messageId === undefined ? [] : [this.messageId],
     ]
-    return `model returned a completed response with no content (${facts.join(', ')})`
   }
 
   private emitUsage(chunks: StreamChunk[]): void {
@@ -505,6 +515,7 @@ export class AnthropicStreamTranslator {
             break
           }
           default:
+            if (typeof block?.type === 'string') this.skippedBlockTypes.add(block.type)
             break
         }
         return chunks
@@ -561,6 +572,11 @@ export class AnthropicStreamTranslator {
           case 'max_tokens':
             this.stopReason = 'max-tokens'
             break
+          case 'model_context_window_exceeded':
+            // The output was cut at the window: partial content reads like a length stop.
+            this.stopReason = 'max-tokens'
+            this.contextExceeded = true
+            break
           default:
             break
         }
@@ -573,7 +589,19 @@ export class AnthropicStreamTranslator {
           chunks.push({ type: 'block-end', index: block.index, block: closeBlock(block) })
         }
         this.emitUsage(chunks)
-        if (this.stopReason === 'stop' && !this.sawAnyBlock) {
+        if (this.contextExceeded && !this.sawAnyBlock) {
+          // Nothing fit: report the overflow, which the host answers by compacting and retrying.
+          chunks.push({
+            type: 'finish',
+            reason: {
+              kind: 'error',
+              failure: {
+                message: `the conversation filled the model's context window before it produced any output (${this.responseFacts().join(', ')})`,
+                code: CONTEXT_WINDOW_EXCEEDED_CODE,
+              },
+            },
+          })
+        } else if (this.stopReason === 'stop' && !this.sawAnyBlock) {
           chunks.push({
             type: 'finish',
             reason: {
