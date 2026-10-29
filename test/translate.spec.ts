@@ -432,6 +432,39 @@ test('Responses translator: response.failed maps context overflow and quota', ()
   )
 })
 
+test('Responses translator: an error event reports the detail the ChatGPT backend nests under `error`', () => {
+  const nested = new ResponsesStreamTranslator()
+  assert.throws(
+    () => nested.push({ type: 'error', error: { type: 'server_error', code: 'server_is_overloaded', message: 'try again later' } }),
+    (error: unknown) => error instanceof LlmError && error.code === 'SERVER' && error.message === 'try again later',
+  )
+  const quota = new ResponsesStreamTranslator()
+  assert.throws(
+    () => quota.push({ type: 'error', error: { code: 'insufficient_quota', message: 'out of credits' } }),
+    (error: unknown) => error instanceof LlmError && error.code === 'QUOTA',
+  )
+})
+
+test('Responses translator: a failure without code or message still names what arrived', () => {
+  const bare = new ResponsesStreamTranslator()
+  assert.throws(
+    () => bare.push({ type: 'response.failed', response: { id: 'resp_123', status: 'failed', error: null } }),
+    (error: unknown) => error instanceof LlmError && error.code === 'SERVER'
+      && error.message === 'the provider reported a failed response without an error code or message (response.failed, resp_123, status failed)',
+  )
+  const opaque = new ResponsesStreamTranslator()
+  assert.throws(
+    () => opaque.push({ type: 'error', error: { type: 'server_error', code: '', message: ' ' } }),
+    (error: unknown) => error instanceof LlmError
+      && error.message === 'the provider reported a failed response without an error code or message (error): {"type":"server_error","code":"","message":" "}',
+  )
+  const long = new ResponsesStreamTranslator()
+  assert.throws(
+    () => long.push({ type: 'error', error: { type: 'x'.repeat(400) } }),
+    (error: unknown) => error instanceof LlmError && error.message.endsWith('…') && error.message.length < 420,
+  )
+})
+
 test('toAnthropicMessages: merge, tool_use input parsing, tool_result', () => {
   const messages = toAnthropicMessages([
     message('system', [{ type: 'text', text: 'system text' }]),
