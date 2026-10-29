@@ -778,11 +778,40 @@ test('Anthropic translator: stop reasons and empty completion', () => {
     type: 'finish',
     reason: {
       kind: 'error',
-      failure: { message: 'model returned a completed response with no content', code: 'EMPTY_RESPONSE' },
+      failure: {
+        message: 'model returned a completed response with no content (stop_reason end_turn, 0 output tokens)',
+        code: 'EMPTY_RESPONSE',
+      },
     },
   })
   const usageIndex = empty.findIndex(chunk => chunk.type === 'usage')
   assert.ok(usageIndex >= 0 && usageIndex < empty.length - 1, 'usage comes before finish')
+})
+
+test('Anthropic translator: an empty completion says why it stopped', () => {
+  const failureOf = (chunks: StreamChunk[]): unknown => {
+    const last = chunks.at(-1)
+    return last?.type === 'finish' && last.reason.kind === 'error' ? last.reason.failure : undefined
+  }
+  // A stop reason the translator does not map (a refusal) still finishes empty, now naming it.
+  const refused = drain(new AnthropicStreamTranslator(), [
+    { type: 'message_start', message: { id: 'msg_123', usage: { input_tokens: 5 } } },
+    { type: 'message_delta', delta: { stop_reason: 'refusal' }, usage: { output_tokens: 7 } },
+    { type: 'message_stop' },
+  ])
+  assert.deepEqual(failureOf(refused), {
+    message: 'model returned a completed response with no content (stop_reason refusal, 7 output tokens, msg_123)',
+    code: 'EMPTY_RESPONSE',
+  })
+  // A stream that stops without any message_delta never sent a stop reason at all.
+  const unstopped = drain(new AnthropicStreamTranslator(), [
+    { type: 'message_start', message: { id: 'msg_456', usage: { input_tokens: 5 } } },
+    { type: 'message_stop' },
+  ])
+  assert.deepEqual(failureOf(unstopped), {
+    message: 'model returned a completed response with no content (stop_reason not sent, 0 output tokens, msg_456)',
+    code: 'EMPTY_RESPONSE',
+  })
 })
 
 test('Anthropic translator: error event mapping', () => {
