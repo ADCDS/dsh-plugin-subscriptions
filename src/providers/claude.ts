@@ -182,6 +182,17 @@ export const CLAUDE_BETA_FALLBACK = [
 
 const CLAUDE_BETA_FLAGS = CLAUDE_BETA_FALLBACK
 
+/** Beta that lets `fallbacks: "default"` reroute a classifier refusal server-side, as Claude Code sends it. */
+export const CLAUDE_SERVER_FALLBACK_BETA = 'server-side-fallback-2026-07-01'
+
+/**
+ * Models with server-side fallback (Anthropic's "Refusals and fallback"
+ * guide). Claude Haiku 5.5 has none, and older models take no `fallbacks`.
+ */
+const SERVER_FALLBACK_MODELS: ReadonlySet<string> = new Set([
+  'claude-fable-5-1', 'claude-mythos-5-1', 'claude-fable-5', 'claude-opus-5-5', 'claude-opus-5', 'claude-sonnet-5-5',
+])
+
 /** Static claude flow facts for the OAuth flow engine. */
 export const claudeFlow: FlowSpec = {
   callbackPath: CLAUDE_CALLBACK_PATH,
@@ -569,6 +580,12 @@ export interface ClaudeAdapterOptions {
    * the next turn without a restart; undefined falls back to `promptCacheTtl`.
    */
   promptCacheTtlOverride?: () => PromptCacheTtl | undefined
+  /**
+   * Let Anthropic reroute a safety-classifier refusal to the model it
+   * recommends for that category (Claude Code's "switch models when a message
+   * is flagged"). Defaults to on.
+   */
+  switchModelsOnFlag?: boolean
 }
 
 /**
@@ -605,6 +622,7 @@ const CLAUDE_MODALITIES: readonly ('text' | 'image')[] = ['text', 'image']
  * @param thinking - the thinking parameter, when the model takes one.
  * @param effort - the reasoning effort, when the model advertises efforts.
  * @param cacheTtl - lifetime of every cache breakpoint; defaults to five minutes.
+ * @param fallbacks - server-side refusal fallback mode, when the request opts in.
  * Requests that carry a `purpose` (compaction, session titles) always use five
  * minutes to preserve their existing auxiliary-request behavior. A five-minute
  * mark can still read an entry a one-hour mark wrote.
@@ -617,6 +635,7 @@ export function claudeRequestBody(
   thinking?: Record<string, unknown>,
   effort?: string,
   cacheTtl?: PromptCacheTtl,
+  fallbacks?: 'default',
 ): Record<string, unknown> {
   const ttl = options.purpose === undefined ? cacheTtl : undefined
   const anthropicMessages = toAnthropicMessages(messages)
@@ -631,6 +650,7 @@ export function claudeRequestBody(
       : {},
     ...thinking === undefined ? {} : { thinking },
     ...effort === undefined ? {} : { output_config: { effort } },
+    ...fallbacks === undefined ? {} : { fallbacks },
     stream: true,
     ...options.sessionId !== undefined ? { metadata: { user_id: String(options.sessionId) } } : {},
   }
@@ -819,12 +839,14 @@ export class ClaudeAdapter extends LlmAdapter {
 
   private async *streamCore(options: GenerateOptions, account?: string): AsyncIterable<StreamChunk> {
     const watchdog = idleWatchdog(options.signal, this.options.streamIdleTimeoutMs)
+    // Fallback-eligible requests opt into Anthropic's refusal reroute.
+    const fallback = this.options.switchModelsOnFlag !== false && SERVER_FALLBACK_MODELS.has(options.model)
     try {
       let session = await this.options.tokens.session(account)
-      let response = await this.request(options, session, watchdog.signal)
+      let response = await this.request(options, session, watchdog.signal, fallback)
       if (response.status === 401) {
         session = await this.options.tokens.session(account, true)
-        response = await this.request(options, session, watchdog.signal)
+        response = await this.request(options, session, watchdog.signal, fallback)
       }
       if (!response.ok) {
         throw await httpLlmError(response, 'claude API', {
@@ -835,7 +857,7 @@ export class ClaudeAdapter extends LlmAdapter {
       if (response.body === null) {
         throw new LlmError('claude API returned no response body', EMPTY_RESPONSE_CODE)
       }
-      yield* streamAnthropic(response.body, () => { watchdog.pulse() })
+      yield* streamAnthropic(response.body, () => { watchdog.pulse() }, { holdToolCalls: fallback, requestedModel: options.model })
     } catch (error: unknown) {
       throw mapFetchFailure('claude API', error, watchdog, options.signal)
     } finally {
@@ -860,7 +882,7 @@ export class ClaudeAdapter extends LlmAdapter {
     return undefined
   }
 
-  private async request(options: GenerateOptions, session: ClaudeSession, signal: AbortSignal): Promise<Response> {
+  private async request(options: GenerateOptions, session: ClaudeSession, signal: AbortSignal, fallback = false): Promise<Response> {
     const messages = await resolveImages(options.messages, this.options.resolveAttachments?.(), signal, CLAUDE_IMAGE_LIMIT)
     if (hostSupportsImageOffload()) {
       const offloadImages = requiredImageOffloadCount(messages, CLAUDE_REQUEST_IMAGE_BUDGET)
@@ -882,14 +904,14 @@ export class ClaudeAdapter extends LlmAdapter {
       ? String(options.reasoningEffort)
       : undefined
     const cacheTtl = this.options.promptCacheTtlOverride?.() ?? this.options.promptCacheTtl
-    const body = claudeRequestBody(options, messages, maxTokens, thinking, effort, cacheTtl)
+    const body = claudeRequestBody(options, messages, maxTokens, thinking, effort, cacheTtl, fallback ? 'default' : undefined)
     const cliVersion = await (this.options.resolveCliVersion ?? localClaudeCliVersion)()
     return proxiedFetch(CLAUDE_API_URL, {
       method: 'POST',
       headers: {
         'authorization': `Bearer ${session.accessToken}`,
         'anthropic-version': '2023-06-01',
-        'anthropic-beta': CLAUDE_BETA_FLAGS,
+        'anthropic-beta': fallback ? `${CLAUDE_BETA_FLAGS},${CLAUDE_SERVER_FALLBACK_BETA}` : CLAUDE_BETA_FLAGS,
         'user-agent': claudeCliUserAgent(cliVersion),
         'x-app': 'cli',
         'anthropic-dangerous-direct-browser-access': 'true',

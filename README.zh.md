@@ -202,6 +202,7 @@ Codex 模型还可填写上下文 token 数，留空跟随服务商。插件读�
     providers: [codex, claude]        # 子集;默认五个全启用
     streamIdleTimeoutMs: 300000
     claudePromptCacheTtl: 5m           # Claude 提示缓存时长:5m(默认)或 1h
+    claudeSwitchModelsOnFlag: true     # 允许 Anthropic 改道被分类器拒绝的请求(默认 true)
     rateLimit:
       wait: true                       # 等待限流窗口重开(默认开启)
       maxWaitMs: 21600000              # 单次等待上限;6 小时,足够覆盖 5 小时会话窗口
@@ -211,6 +212,12 @@ Codex 模型还可填写上下文 token 数，留空跟随服务商。插件读�
       copilot:                         # 手工条目会关闭 Copilot 目录发现
         - { id: gpt-5.6-sol, wire: responses }   # 仅 copilot:强制指定上游协议
 ```
+
+`claudeSwitchModelsOnFlag`(本分支，默认 `true`)对应 Claude Code 的“消息被标记时切换模型”：发往支持
+Anthropic 服务端回退的模型(Fable 5 与 5.1、Mythos 5.1、Opus 5 与 5.5、Sonnet 5.5)的请求会带上
+`fallbacks: "default"` 与 `server-side-fallback-2026-07-01` beta；安全分类器拒绝时，Anthropic 会在同一请求内
+改用它为该类别推荐的模型作答。是否改道、改到哪个模型由 Anthropic 决定。`finish` chunk 以 `servedBy` 报告实际
+作答的模型；没有回退接住的拒绝会成为终止性的 `REFUSAL`(不重试，也不冷却账号)，而不是空回复。
 
 `claudePromptCacheTtl` 决定 Anthropic 在最近一次使用之后保留 Claude 对话缓存多久。默认 `5m` 发送的请求
 与之前的版本完全一致。设为 `1h` 时，每个缓存断点（工具+系统提示前缀，以及对话中的三个标记）都会带上

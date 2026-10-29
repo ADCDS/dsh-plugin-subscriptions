@@ -19,6 +19,7 @@ import type { ReasoningReplayItem, ResponsesStreamEvent } from '../src/translate
 import {
   AnthropicStreamTranslator,
   CLAUDE_CODE_IDENTITY,
+  REFUSAL_CODE,
   cacheControl,
   markMessageCache,
   toAnthropicMessages,
@@ -793,14 +794,14 @@ test('Anthropic translator: an empty completion says why it stopped', () => {
     const last = chunks.at(-1)
     return last?.type === 'finish' && last.reason.kind === 'error' ? last.reason.failure : undefined
   }
-  // A stop reason the translator does not map (a refusal) still finishes empty, now naming it.
-  const refused = drain(new AnthropicStreamTranslator(), [
+  // A stop reason the translator does not map (pause_turn here) still finishes empty, now naming it.
+  const paused = drain(new AnthropicStreamTranslator(), [
     { type: 'message_start', message: { id: 'msg_123', usage: { input_tokens: 5 } } },
-    { type: 'message_delta', delta: { stop_reason: 'refusal' }, usage: { output_tokens: 7 } },
+    { type: 'message_delta', delta: { stop_reason: 'pause_turn' }, usage: { output_tokens: 7 } },
     { type: 'message_stop' },
   ])
-  assert.deepEqual(failureOf(refused), {
-    message: 'model returned a completed response with no content (stop_reason refusal, 7 output tokens, msg_123)',
+  assert.deepEqual(failureOf(paused), {
+    message: 'model returned a completed response with no content (stop_reason pause_turn, 7 output tokens, msg_123)',
     code: 'EMPTY_RESPONSE',
   })
   // A stream that stops without any message_delta never sent a stop reason at all.
@@ -851,6 +852,67 @@ test('Anthropic translator: a reply cut off by the context window is an overflow
     { type: 'message_stop' },
   ])
   assert.deepEqual(partial.at(-1), { type: 'finish', reason: { kind: 'max-tokens' } })
+})
+
+test('Anthropic translator: a server-side fallback reports the serving model and drops the declined side\'s tool call', () => {
+  const chunks = drain(new AnthropicStreamTranslator({ holdToolCalls: true, requestedModel: 'claude-opus-5-5' }), [
+    { type: 'message_start', message: { id: 'msg_a', model: 'claude-opus-5-5', usage: { input_tokens: 10 } } },
+    // The requested model began a tool call before the classifier declined.
+    { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'tc_1', name: 'run' } },
+    { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"a":1}' } },
+    { type: 'content_block_stop', index: 0 },
+    // The handoff to the model that continues.
+    { type: 'content_block_start', index: 1, content_block: { type: 'fallback', from: { model: 'claude-opus-5-5' }, to: { model: 'claude-opus-4-8' }, trigger: { type: 'refusal', category: 'cyber' } } },
+    { type: 'content_block_stop', index: 1 },
+    { type: 'content_block_start', index: 2, content_block: { type: 'text' } },
+    { type: 'content_block_delta', index: 2, delta: { type: 'text_delta', text: 'ok' } },
+    { type: 'content_block_stop', index: 2 },
+    { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 } },
+    { type: 'message_stop' },
+  ])
+  const text = chunks.filter(c => c.type === 'text-delta').map(c => (c as { text: string }).text).join('')
+  assert.equal(text, 'ok')
+  // The declined model's tool call never surfaces.
+  assert.ok(!chunks.some(c => c.type === 'block-end' && c.block.type === 'tool-call'), 'the declined tool call is dropped')
+  const finish = chunks.at(-1) as { type: string; reason: { kind: string }; servedBy?: unknown }
+  assert.equal(finish.type, 'finish')
+  assert.equal(finish.reason.kind, 'stop')
+  assert.deepEqual(finish.servedBy, { model: 'claude-opus-4-8', reason: 'refusal-fallback', from: 'claude-opus-5-5', category: 'cyber' })
+})
+
+test('Anthropic translator: sticky routing (a later turn served by the fallback model with no handoff block) still reports servedBy', () => {
+  const chunks = drain(new AnthropicStreamTranslator({ holdToolCalls: true, requestedModel: 'claude-opus-5-5' }), [
+    { type: 'message_start', message: { id: 'msg_b', model: 'claude-opus-4-8', usage: { input_tokens: 10 } } },
+    { type: 'content_block_start', index: 0, content_block: { type: 'text' } },
+    { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } },
+    { type: 'content_block_stop', index: 0 },
+    { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 } },
+    { type: 'message_stop' },
+  ])
+  const finish = chunks.at(-1) as { servedBy?: unknown }
+  assert.deepEqual(finish.servedBy, { model: 'claude-opus-4-8', reason: 'refusal-fallback', from: 'claude-opus-5-5' })
+})
+
+test('Anthropic translator: a decline that no fallback answered is a terminal REFUSAL naming the category', () => {
+  const failureOf = (chunks: StreamChunk[]): { message: string; code: string } | undefined => {
+    const last = chunks.at(-1)
+    return last?.type === 'finish' && last.reason.kind === 'error' ? last.reason.failure as { message: string; code: string } : undefined
+  }
+  // A declined model with a tool call open: the partial tool work is discarded, not surfaced.
+  const refused = drain(new AnthropicStreamTranslator({ holdToolCalls: true, requestedModel: 'claude-opus-5-5' }), [
+    { type: 'message_start', message: { id: 'msg_c', model: 'claude-opus-5-5', usage: { input_tokens: 10 } } },
+    { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'tc_1', name: 'run' } },
+    { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{}' } },
+    { type: 'content_block_stop', index: 0 },
+    { type: 'message_delta', delta: { stop_reason: 'refusal', stop_details: { type: 'refusal', category: 'cyber', explanation: 'declined by policy', recommended_model: 'claude-opus-4-8' } }, usage: { output_tokens: 0 } },
+    { type: 'message_stop' },
+  ])
+  assert.ok(!refused.some(c => c.type === 'block-end' && c.block.type === 'tool-call'), 'partial tool work is discarded')
+  const failure = failureOf(refused)
+  assert.equal(failure?.code, REFUSAL_CODE)
+  assert.match(failure?.message ?? '', /cyber/)
+  assert.match(failure?.message ?? '', /declined by policy/)
+  assert.match(failure?.message ?? '', /claude-opus-4-8/)
 })
 
 test('Anthropic translator: error event mapping', () => {

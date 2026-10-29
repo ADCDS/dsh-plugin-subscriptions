@@ -175,6 +175,12 @@ export interface Config {
    * compaction and session-title requests always stay on five minutes.
    */
   claudePromptCacheTtl?: PromptCacheTtl
+  /**
+   * Let Anthropic reroute a safety-classifier refusal to the model it
+   * recommends for that category, like Claude Code's "switch models when a
+   * message is flagged" (default true).
+   */
+  claudeSwitchModelsOnFlag?: boolean
   /** Whether and how long a route waits out a closed rate-limit window. */
   rateLimit?: RateLimitConfig
   /** Advisory model catalogs overriding the built-in defaults, per provider. */
@@ -234,6 +240,7 @@ export const Config: z<Config> = z.object({
   codexClientVersion: z.string(),
   streamIdleTimeoutMs: z.number().min(1).default(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
   claudePromptCacheTtl: z.union(['5m', '1h']).default(DEFAULT_PROMPT_CACHE_TTL),
+  claudeSwitchModelsOnFlag: z.boolean().default(true),
   rateLimit: z.object({
     wait: z.boolean().default(true),
     maxWaitMs: z.number().min(1).default(DEFAULT_RATE_LIMIT_MAX_WAIT_MS),
@@ -941,6 +948,7 @@ export function apply(ctx: Context, config: Config): void {
           defaultEffortOf: (model: string) => defaultEffortOf('claude', model),
           resolveCliVersion: () => claudeVersion.resolve(),
           promptCacheTtl: claudePromptCacheTtl,
+          switchModelsOnFlag: config.claudeSwitchModelsOnFlag ?? true,
           promptCacheTtlOverride: () => preferences.promptCacheTtl(),
           pool: () => poolAdapter,
         })

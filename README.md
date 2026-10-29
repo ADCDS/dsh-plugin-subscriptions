@@ -203,6 +203,7 @@ Existing defaults continue to load from and save to `~/.dsh/plugins/subscription
     providers: [codex, claude]        # subset; default all five
     streamIdleTimeoutMs: 300000
     claudePromptCacheTtl: 5m           # Claude prompt-cache lifetime: 5m (default) or 1h
+    claudeSwitchModelsOnFlag: true     # let Anthropic reroute a classifier refusal (default true)
     rateLimit:
       wait: true                       # wait out a closed rate-limit window (default)
       maxWaitMs: 21600000              # ceiling on one wait; 6 h, covers a 5-hour session window
@@ -212,6 +213,14 @@ Existing defaults continue to load from and save to `~/.dsh/plugins/subscription
       copilot:                         # manual entries disable Copilot catalog discovery
         - { id: gpt-5.6-sol, wire: responses }   # copilot only: force the upstream protocol
 ```
+
+`claudeSwitchModelsOnFlag` (this fork, default `true`) mirrors Claude Code's "switch models when a message is
+flagged": requests to models with Anthropic server-side fallback (Fable 5 and 5.1, Mythos 5.1, Opus 5 and 5.5,
+Sonnet 5.5) carry `fallbacks: "default"` and the `server-side-fallback-2026-07-01` beta, so when a safety
+classifier declines, Anthropic retries on the model it recommends for that category and the answer streams on
+the same request. Anthropic decides whether and where to reroute. The `finish` chunk reports the model that
+answered as `servedBy`, and a refusal no fallback answered is a terminal `REFUSAL` (never retried, and no
+account is cooled), not an empty reply.
 
 `claudePromptCacheTtl` sets how long Anthropic keeps the Claude conversation cache after its last use.
 It can also be changed without a restart from Settings → Subscriptions → Claude → Manage ("Prompt cache

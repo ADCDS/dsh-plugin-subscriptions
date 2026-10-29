@@ -711,6 +711,12 @@ test('claudeRequestBody ships the cache breakpoints and never exceeds four', () 
   assert.equal(body.stream, true)
 })
 
+test('claudeRequestBody carries the server-side fallback opt-in only when asked', () => {
+  const options = { provider: 'claude', model: 'claude-opus-5-5', messages: [] as Message[], system: 's' }
+  assert.equal(claudeRequestBody(options, [], 1_000).fallbacks, undefined, 'off by default on the pure body')
+  assert.equal(claudeRequestBody(options, [], 1_000, undefined, undefined, undefined, 'default').fallbacks, 'default')
+})
+
 /** A long enough history that the request places all four breakpoints. */
 function claudeHistory(turns: number): Message[] {
   const history: Message[] = [claudeMessage('s0', 'system', 'opening')]
