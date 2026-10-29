@@ -88,11 +88,13 @@ Image generation and editing share same-provider account scheduling: try the def
 
 ### DSH compatibility
 
-Version `0.9.7` added support for DSH `0.2.0-rc.2`; DSH `0.2.1-alpha.2`, `0.2.1-alpha.3`, `0.2.1-rc.2` and `0.2.1-rc.3` are supported as well, with development dependencies pinned to `0.2.1-rc.2`. It handles request-only messages, first-class tool results, preparing tool views, and offloaded image placeholders while retaining legacy history translation. `0.2.1-rc.2` additionally requires tool arguments on every call head and takes the web runtime's provider overrides as `Volatile` refs. Other `0.2` prereleases are not implicitly allowed.
+DSH peers use two short ranges with no upper bound: `>=0.2.0-rc.2 || >=0.2.1-0`. The first retains the minimum supported version; the second admits all `0.2.1` alpha/RC builds under npm/pnpm's default peer matching, avoiding version-mismatch warnings from these five DSH peers for that release line. Maintain one prerelease anchor per supported release line, not an entry for every RC. Development dependencies remain pinned to `0.2.1-rc.2`.
+
+Harness uses `includePrerelease: true` and admits all versions at or above the minimum, including future prereleases. npm/pnpm default matching admits later stable versions but requires an explicit prerelease anchor for each new release line (for example, `>=0.2.2-0` for `0.2.2` prereleases). There is no upper bound: future incompatible releases are not blocked, and admission does not guarantee runtime compatibility.
 
 In DSH `0.2.1-rc.2`, the load-time check uses `engines.dsh` when declared; otherwise, every `@deepseek-ai/dsh` and `@deepseek-ai/dsh-*` peer must match the running DSH version. Prereleases participate in this check. This plugin does not declare `engines.dsh`, so its DSH peer ranges determine whether it can load. The `@deepseek-ai/cordis` and `@deepseek-ai/schemastery` peers affect package-manager dependency resolution, not this load-time check. They keep their `^4.0.1` / `^3.18.1` floors and also list the `4.0.5-alpha` / `3.18.5-alpha` builds bundled with DSH `0.2.1-alpha.2` and `0.2.1-alpha.3`, because those caret ranges exclude these prereleases under npm's default semver rules.
 
-The current release supports the published DSH `0.1.1-rc.2`, `0.1.2-alpha`/`rc`, `0.1.3-alpha`, `0.1.5-alpha`/`rc`, and `0.1.7-rc` lines, including `0.1.5-rc.2` and `0.1.7-rc.2`. The `0.1.5-alpha.1` peer-range anchor intentionally covers the later `0.1.5-alpha`, `0.1.5-rc`, and stable `0.1.5` builds under npm semver rules; the `0.1.7-rc.1` anchor likewise covers the later `0.1.7-rc` and stable `0.1.7` builds. DSH `0.1.6-alpha` and `0.1.7-alpha` are not included until they have been separately verified.
+DSH `0.1.x` is no longer supported. Users on that line must upgrade to a supported DSH version or retain an older compatible plugin release.
 
 ### Managing accounts and pool models
 
