@@ -58,6 +58,20 @@ export interface PoolAdapterOptions {
 const STICKY_SESSION_LIMIT = 1000
 
 /** Display form of one member (account shown when pinned). */
+/** The translators' own empty-completion text, whose parenthetical holds only stop reason, token and message-id facts. */
+const EMPTY_COMPLETION = /^model returned a completed response with no content \((.+)\)$/
+
+/**
+ * The stop facts of a translator-reported empty completion, for the exhausted
+ * summary. Only that text is echoed: it names no account and carries no
+ * upstream body, unlike the member-labelled failures beside it.
+ */
+function emptyCompletionFacts(cause: LlmError): string {
+  if (cause.code !== EMPTY_RESPONSE_CODE) return ''
+  const facts = EMPTY_COMPLETION.exec(cause.message)?.[1]
+  return facts === undefined ? '' : ` (${facts})`
+}
+
 function memberLabel(member: PoolMemberRef): string {
   return member.account === undefined
     ? `${member.provider}/${member.model}`
@@ -445,7 +459,7 @@ export class PoolAdapter extends LlmAdapter {
         : reasons.some(item => item === 'RATE_LIMIT' || item === 'CODEX_BURST_429' || item === QUOTA_EXCEEDED_CODE)
           ? 'RATE_LIMIT' : reason ?? 'NO_ADAPTER'
     const message = `pool "${model}" exhausted: ${pool.length === 0 ? 'no eligible account' : `members [${states.join(', ')}]`}`
-      + `${cause instanceof LlmError ? `; last failure ${cause.code}${cause.failure.status === undefined ? '' : ` (HTTP ${String(cause.failure.status)})`}` : ''}`
+      + `${cause instanceof LlmError ? `; last failure ${cause.code}${cause.failure.status === undefined ? '' : ` (HTTP ${String(cause.failure.status)})`}${emptyCompletionFacts(cause)}` : ''}`
     this.options.onWarn(message)
     return new LlmError(
       message,

@@ -728,6 +728,31 @@ test('stream: a transport failure on a single-member pool is reported as TRANSPO
   assert.ok(warnings.some(message => message.startsWith('pool "m" exhausted: members [1:')), 'the exhaustion is logged')
 })
 
+test('stream: an exhausted pool keeps a translator-reported empty completion\'s stop facts, never a member label', async () => {
+  const single = new Map<string, PoolDefinition>([
+    [poolKey('codex', 'm'), { members: [{ provider: 'codex', account: 'someone@example.com', model: 'm' }] }],
+  ])
+  const translated = new FakeAdapter(async function* () {
+    yield { type: 'finish', reason: { kind: 'error', failure: {
+      code: 'EMPTY_RESPONSE',
+      message: 'model returned a completed response with no content (stop_reason refusal, 7 output tokens, msg_123)',
+    } } }
+  })
+  await assert.rejects(collect(makePool({ codex: translated }, { families: single }).pool.stream(OPTIONS)), (error: unknown) => {
+    assert.ok(error instanceof LlmError)
+    assert.match(error.message, /; last failure EMPTY_RESPONSE \(stop_reason refusal, 7 output tokens, msg_123\)$/)
+    return true
+  })
+  // The pool's own empty-stream failure names the member, account included: it is not echoed.
+  const silent = new FakeAdapter(() => serveEmpty())
+  await assert.rejects(collect(makePool({ codex: silent }, { families: single }).pool.stream(OPTIONS)), (error: unknown) => {
+    assert.ok(error instanceof LlmError)
+    assert.match(error.message, /; last failure EMPTY_RESPONSE$/)
+    assert.doesNotMatch(error.message, /someone@example\.com/)
+    return true
+  })
+})
+
 test('stream: a pool whose every member is already cooling reports the cooling reason (issue #139)', async () => {
   const codex = new FakeAdapter(() => serveOk())
   const { pool, health } = makePool({ codex })
