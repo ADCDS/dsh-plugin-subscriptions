@@ -226,11 +226,14 @@ export interface ResponsesStreamEvent {
     content?: Array<{ type?: string; text?: string }>
   }
   response?: {
+    id?: string
     status?: string
     usage?: ResponsesUsage
-    error?: { code?: string; message?: string; headers?: unknown }
+    error?: { code?: string; message?: string; headers?: unknown } | null
     incomplete_details?: { reason?: string }
   }
+  /** Detail of an `error` event; the ChatGPT backend nests it here, as the Codex CLI reads it. */
+  error?: { code?: string; message?: string; type?: string } | null
   code?: string
   message?: string
   /**
@@ -267,6 +270,35 @@ export function mapResponsesUsage(usage: ResponsesUsage): TokenUsage {
   }
 }
 
+/** Longest excerpt of a failure event's raw error object kept in the report. */
+const FAILURE_EXCERPT_CHARS = 300
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim().length > 0 ? value : undefined
+}
+
+/**
+ * Describe a failure event that carried no usable code or message, so the
+ * report still names what arrived: the event type, the response id and
+ * status, and a bounded excerpt of whatever error object it held.
+ * @param event - the failure event.
+ * @returns the fallback failure text.
+ */
+export function describeResponsesFailure(event: ResponsesStreamEvent): string {
+  const facts = [event.type]
+  const id = nonEmptyString(event.response?.id)
+  if (id !== undefined) facts.push(id)
+  const status = nonEmptyString(event.response?.status)
+  if (status !== undefined) facts.push(`status ${status}`)
+  const raw = event.error ?? event.response?.error ?? event.response?.incomplete_details
+  let excerpt = ''
+  if (raw !== undefined && raw !== null) {
+    const json = JSON.stringify(raw)
+    excerpt = `: ${json.length > FAILURE_EXCERPT_CHARS ? `${json.slice(0, FAILURE_EXCERPT_CHARS)}…` : json}`
+  }
+  return `the provider reported a failed response without an error code or message (${facts.join(', ')})${excerpt}`
+}
+
 /**
  * Read the provider's own backoff hint off a Responses error payload.
  *
@@ -297,14 +329,16 @@ function retryAfterMsFromPayload(headers: unknown): number | undefined {
  * @param code - provider error code, when present.
  * @param message - provider error message, when present.
  * @param headers - the payload's `headers` member, carrying `retry-after`.
+ * @param fallback - the text to report when neither is present.
  * @returns the mapped error (context overflow, quota, otherwise SERVER).
  */
 export function responsesFailure(
   code: string | undefined,
   message: string | undefined,
   headers?: unknown,
+  fallback = 'the provider reported a failed response',
 ): LlmError {
-  const text = message ?? code ?? 'the provider reported a failed response'
+  const text = message ?? code ?? fallback
   const detail = `${code ?? ''} ${message ?? ''}`
   const retryAfterMs = retryAfterMsFromPayload(headers)
   const extra = retryAfterMs === undefined ? {} : { providerRetryAfterMs: retryAfterMs }
@@ -515,9 +549,10 @@ export class ResponsesStreamTranslator {
       }
       case 'response.failed':
         throw responsesFailure(
-          event.response?.error?.code,
-          event.response?.error?.message,
+          nonEmptyString(event.response?.error?.code),
+          nonEmptyString(event.response?.error?.message),
           event.response?.error?.headers,
+          describeResponsesFailure(event),
         )
       case 'response.incomplete':
         throw responsesFailure(
@@ -531,9 +566,10 @@ export class ResponsesStreamTranslator {
         // so every streamed upstream failure collapsed to the generic "the
         // provider reported a failed response" and lost its retry hint.
         throw responsesFailure(
-          event.error?.code ?? event.code,
-          event.error?.message ?? event.message,
+          nonEmptyString(event.error?.code) ?? nonEmptyString(event.code),
+          nonEmptyString(event.error?.message) ?? nonEmptyString(event.message),
           event.error?.headers,
+          describeResponsesFailure(event),
         )
       default:
         // response.created, response.in_progress, content_part events, etc.: no chunks.
