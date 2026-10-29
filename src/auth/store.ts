@@ -38,6 +38,11 @@ export interface CodexSession {
   emailAddress?: string
   /** `chatgpt_plan_type` claim from the id token (e.g. `plus`, `pro`), when present. */
   planType?: string
+  /**
+   * True when this account was imported from the Codex CLI's `auth.json`: only
+   * bound accounts sync refreshes back to it.
+   */
+  cliBound?: boolean
 }
 
 /** Stored Claude Pro/Max subscription session. */

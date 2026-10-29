@@ -173,7 +173,9 @@ GitHub 安装的:重新执行一遍 `add github:V1ki/dsh-plugin-subscriptions` �
 
 ### 多账号
 
-每个 provider 可以登录多个账号:连上第一个之后,卡片会出现「添加账号」按钮(Claude 拆分为「浏览器授权」和「导入 Claude Code」两种)。账号按身份(邮箱/用户名)归档——重复登录同一账号是覆盖更新,不同账号才是新增。浏览器授权以浏览器当前登录的账号为准,要添加不同账号请先在浏览器切换账号,或用无痕窗口走手动授权码。★ 默认账号服务直连路由;池路由会使用所有账号。从 Claude Code 导入的 Claude 账号会与 CLI 的凭据存储保持同步;OAuth 添加的 Claude 账号独立刷新,多个账号不会互相覆盖 Keychain。
+每个 provider 可以登录多个账号:连上第一个之后,卡片会出现「添加账号」按钮(Claude 拆分为「浏览器授权」和「导入 Claude Code」两种;Codex 拆分为「浏览器授权」和「导入 Codex CLI」两种)。账号按身份(邮箱/用户名)归档——重复登录同一账号是覆盖更新,不同账号才是新增。浏览器授权以浏览器当前登录的账号为准,要添加不同账号请先在浏览器切换账号,或用无痕窗口走手动授权码。★ 默认账号服务直连路由;池路由会使用所有账号。从 Claude Code 导入的 Claude 账号会与 CLI 的凭据存储保持同步;OAuth 添加的 Claude 账号独立刷新,多个账号不会互相覆盖 Keychain。
+
+「导入 Codex CLI」(本分支)读取 `codex` CLI 保存在 `$CODEX_HOME/auth.json`(默认 `~/.codex`;使用文件凭据存储,而非系统钥匙串)中的 ChatGPT 登录,直接共用,无需再登录一次。OpenAI 会轮换刷新令牌并拒绝重复使用,因此导入的账号与该文件保持同步:刷新前,若 CLI 已轮换则直接采用;刷新后,把新令牌写回文件(保留其他字段,权限 0600)。读取—刷新—写回在安装了 `flock(1)` 时持有 CLI 自己的 `auth.lock`,写回无论如何都以比较交换方式进行。Codex CLI 在自行刷新前会重新读取 `auth.json`,所以两边始终使用同一份轮换后的登录。`codex logout` 会同时注销两边;重新登录后再导入即可。浏览器授权添加的 Codex 账号独立刷新。
 
 ### 编辑模型列表、上下文与工具
 
@@ -338,7 +340,7 @@ git tag v0.9.8 && git push origin main v0.9.8
 ## 目录结构
 
 - `src/index.ts` —— 插件入口:配置 schema、adapter 注册、登录态变更通告、RPC 接线
-- `src/auth/` —— PKCE/JWT 工具、token 存储、OAuth 流程引擎(临时本地回调服务)、Claude Code 凭据读取器(Keychain/文件)、`/subscriptions-auth` RPC 通道
+- `src/auth/` —— PKCE/JWT 工具、token 存储、OAuth 流程引擎(临时本地回调服务)、Claude Code 凭据读取器(Keychain/文件)、Codex CLI 凭据读取与 `auth.json` 同步、`/subscriptions-auth` RPC 通道
 - `src/providers/` —— 各 provider 的 OAuth 常量/换发/刷新 + `LlmAdapter` 实现，多账号 token 管理（`accounts.ts`），模型池（`pool.ts` + `pool-health.ts` / `pool-usage.ts` / `pool-family.ts`），以及 `rate-limit.ts`（限流重开时刻解析 + 重试策略）
 - `src/translate/` —— dsh `Message[]` 与 OpenAI Responses / Anthropic Messages 格式互转,SSE → `StreamChunk`
 - `src/tools/` —— `x_search`、`image_generate` 与 `video_generate`

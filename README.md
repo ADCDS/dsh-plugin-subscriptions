@@ -174,7 +174,9 @@ Not logged in? The provider stays out of the picker, and requests fail with `MIS
 
 ### Multiple accounts
 
-Every provider accepts several accounts: once one is connected, the card grows an **Add account** button (Claude offers **Browser authorization** and **Import Claude Code** separately). Accounts are keyed by their identity (email / login) — re-logging the same account updates it in place, a different account appends. Browser authorization signs in whichever account the browser currently uses, so switch accounts there first (or use an incognito window with the manual code) to add a different one. The ★ default account serves the direct provider routes; pool routes use every account. A Claude account imported from Claude Code stays synced with the CLI's credential store; OAuth-added Claude accounts refresh standalone so several accounts never fight over the Keychain entry.
+Every provider accepts several accounts: once one is connected, the card grows an **Add account** button (Claude offers **Browser authorization** and **Import Claude Code** separately; Codex offers **Browser authorization** and **Import Codex CLI**). Accounts are keyed by their identity (email / login) — re-logging the same account updates it in place, a different account appends. Browser authorization signs in whichever account the browser currently uses, so switch accounts there first (or use an incognito window with the manual code) to add a different one. The ★ default account serves the direct provider routes; pool routes use every account. A Claude account imported from Claude Code stays synced with the CLI's credential store; OAuth-added Claude accounts refresh standalone so several accounts never fight over the Keychain entry.
+
+**Import Codex CLI** (this fork) reads the ChatGPT login the `codex` CLI keeps in `$CODEX_HOME/auth.json` (default `~/.codex`; the file credential store, not the OS keyring) and shares it instead of signing in a second time. OpenAI rotates refresh tokens and rejects a reused one, so an imported account stays synced with that file: before refreshing, it adopts a rotation the CLI already made; after refreshing, it writes the new tokens back (other fields preserved, mode 0600). The read-refresh-write runs under the CLI's own `auth.lock` when `flock(1)` is installed, and the write is a compare-and-swap either way. The Codex CLI re-reads `auth.json` before its own refreshes, so both keep using one rotation of the login. Logging out with `codex logout` revokes that login for both; import it again after signing back in. Browser-added Codex accounts refresh standalone.
 
 ### Edit visible models, context windows, and tools
 
@@ -370,7 +372,7 @@ The workflow checks that the tag matches `package.json`, installs with the froze
 ## Layout
 
 - `src/index.ts` — plugin entry: config schema, adapter registration, auth-change re-announce, RPC wiring
-- `src/auth/` — PKCE/JWT helpers, token store, OAuth flow engine (temp loopback callback server), Claude Code credential reader (Keychain/file), `/subscriptions-auth` RPC channel
+- `src/auth/` — PKCE/JWT helpers, token store, OAuth flow engine (temp loopback callback server), Claude Code credential reader (Keychain/file), Codex CLI credential reader and `auth.json` sync, `/subscriptions-auth` RPC channel
 - `src/providers/` — per-provider OAuth constants/exchange/refresh + `LlmAdapter`s, multi-account token plumbing (`accounts.ts`), the pool (`pool.ts` + `pool-health.ts` / `pool-usage.ts` / `pool-family.ts`), and `rate-limit.ts` (reset-instant parsing + retry policy)
 - `src/translate/` — dsh `Message[]` ⟷ OpenAI Responses / Anthropic Messages / Antigravity wire formats, SSE → `StreamChunk`
 - `src/providers/codex-search.ts` — Codex provider for DSH's native `web_search` capability

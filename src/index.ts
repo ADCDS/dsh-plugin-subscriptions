@@ -28,6 +28,7 @@ import { DeviceFlowManager, type DeviceAttempt } from './auth/device-flow.js'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { readClaudeCodeCredentials, refreshClaudeSynced } from './auth/claude-code-creds.js'
+import { readCodexCliCredentials, refreshCodexSynced } from './auth/codex-cli-creds.js'
 import { ResetRedemption } from './providers/reset-redemption.js'
 import { BadRequest, registerAuthRpc } from './auth/rpc.js'
 import type {
@@ -435,6 +436,11 @@ export class SubscriptionsAuthController implements AuthController {
      * failure must not outlive an explicit re-check (issue #139).
      */
     private readonly onUsageForced?: (provider: ProviderId, account: string) => void,
+    /**
+     * Reads the Codex CLI's ChatGPT login from its `auth.json`. Injected for
+     * the same reason as {@link readClaudeCreds}; the plugin uses the default.
+     */
+    private readonly readCodexCreds: () => CodexSession | undefined = readCodexCliCredentials,
   ) {}
 
   prepareReset(account: string, signal: AbortSignal) {
@@ -526,6 +532,20 @@ export class SubscriptionsAuthController implements AuthController {
       const attempt = await this.flows.start('claude', claudeFlow)
       this.completions.set('claude', this.complete('claude', attempt, this.claim('claude')))
       return { authorizeUrl: attempt.authorizeUrl }
+    }
+    if (provider === 'codex' && method === 'cli') {
+      const imported = this.readCodexCreds()
+      if (imported === undefined) {
+        throw new Error('no Codex CLI login found; run `codex login` and sign in with ChatGPT first, or choose the browser flow')
+      }
+      // Same supersession as the Claude import: a browser attempt left in
+      // flight must not land after the imported session.
+      this.claim('codex')
+      this.flows.pending('codex')?.cancel()
+      await this.persist('codex', imported)
+      this.lastError.delete('codex')
+      this.onAuthChanged('codex', accountKeyOf('codex', imported))
+      return { authorizeUrl: '' }
     }
     if (provider === 'copilot') {
       // Device flow: no redirect URI — the UI shows the user code while the
@@ -837,7 +857,10 @@ export function apply(ctx: Context, config: Config): void {
           displayName: 'ChatGPT (Codex)',
           makeOptions: () => ({
             preemptMs: CODEX_PREEMPT_MS,
-            refresh: refreshCodex,
+            // Only CLI-imported accounts sync with the Codex CLI's auth.json;
+            // browser-login accounts refresh standalone.
+            refresh: session =>
+              session.cliBound === true ? refreshCodexSynced(session, refreshCodex, CODEX_PREEMPT_MS) : refreshCodex(session),
             isPermanent: isCodexPermanentRefreshError,
           }),
           onAccountRemoved: account => { authChanged('codex', account) },
@@ -1399,6 +1422,26 @@ export function apply(ctx: Context, config: Config): void {
       }, () => undefined)
     }, 5 * 60_000)
     ctx.effect(() => () => { clearInterval(syncTimer) }, 'dsh-plugin-subscriptions: claude background sync timer')
+  }
+
+  // The same for Codex accounts imported from the Codex CLI: an idle account
+  // still refreshes inside its window, through the auth.json sync, so the CLI
+  // and this plugin keep converging on one rotation of the shared login.
+  if (codexTokens !== undefined) {
+    const tokens = codexTokens
+    const syncTimer = setInterval(() => {
+      void tokens.list().then((accounts) => {
+        for (const { key, session } of accounts) {
+          if (session.cliBound !== true) continue
+          tokens.session(key).catch(() => {
+            // Best-effort: TokenManager already surfaces failures via onRemoved.
+          })
+        }
+      }, () => undefined)
+    }, 5 * 60_000)
+    // Best-effort upkeep must not hold a process open on its own.
+    syncTimer.unref()
+    ctx.effect(() => () => { clearInterval(syncTimer) }, 'dsh-plugin-subscriptions: codex background sync timer')
   }
 
   // `web` is optional on headless/minimal compositions. Register Codex behind
