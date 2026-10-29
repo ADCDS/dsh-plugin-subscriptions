@@ -30,6 +30,10 @@ export const DEFAULT_QUOTA_COOLDOWN_MS = 5 * 60_000
 export const AUTH_COOLDOWN_MS = 24 * 60 * 60_000
 /** Transient server-side failures cool down briefly. */
 export const TRANSIENT_COOLDOWN_MS = 60_000
+/** A Codex 429 without a disclosed reset may be a short burst throttle, not an exhausted subscription. */
+export const CODEX_BURST_COOLDOWN_MS = 2_000
+/** Codex pre-output server errors may clear quickly; retry only after this quiet period. */
+export const CODEX_TRANSIENT_COOLDOWN_MS = 2_000
 
 /** Whether a failure parks one member or the account's whole quota. */
 export type PoolFailureScope = 'member' | 'account'
@@ -78,8 +82,12 @@ export function classifyPoolFailure(error: unknown, provider: ProviderId): PoolF
     case 'RATE_LIMIT':
       return {
         action: 'switch',
-        cooldownMs: retryAfterMs(error) ?? DEFAULT_QUOTA_COOLDOWN_MS,
-        reason: error.code,
+        // Codex can issue a burst 429 while the subscription still has quota.
+        // Only a 429 with no disclosed reset gets a short, bounded probe delay.
+        cooldownMs: retryAfterMs(error) ?? (provider === 'codex' && error.code === 'RATE_LIMIT' && error.failure.status === 429
+          ? CODEX_BURST_COOLDOWN_MS : DEFAULT_QUOTA_COOLDOWN_MS),
+        reason: provider === 'codex' && error.code === 'RATE_LIMIT' && error.failure.status === 429
+          && retryAfterMs(error) === undefined ? 'CODEX_BURST_429' : error.code,
         scope: MODEL_SCOPED_QUOTA_PROVIDERS.has(provider) ? 'member' : 'account',
       }
     case 'AUTH':
@@ -87,10 +95,9 @@ export function classifyPoolFailure(error: unknown, provider: ProviderId): PoolF
     case 'MISSING_CREDENTIAL':
       return { action: 'switch', cooldownMs: AUTH_COOLDOWN_MS, reason: error.code, scope: 'account' }
     case 'SERVER':
-      // Codex Responses may disclose a member-local overload wait inside an SSE error.
-      return { action: 'switch', cooldownMs: (provider === 'codex' ? retryAfterMs(error) : undefined) ?? TRANSIENT_COOLDOWN_MS, reason: error.code, scope: 'member' }
     case 'TIMEOUT':
-      return { action: 'switch', cooldownMs: TRANSIENT_COOLDOWN_MS, reason: error.code, scope: 'member' }
+      // Codex Responses may disclose a member-local overload wait inside an SSE error.
+      return { action: 'switch', cooldownMs: provider === 'codex' ? retryAfterMs(error) ?? CODEX_TRANSIENT_COOLDOWN_MS : TRANSIENT_COOLDOWN_MS, reason: error.code, scope: 'member' }
     case 'EMPTY_RESPONSE':
     case 'TRANSPORT':
       return { action: 'switch' }
@@ -136,13 +143,28 @@ export class PoolHealthRegistry {
 
   /** Whether one registry key is clear right now. */
   isAvailable(key: string, now = Date.now()): boolean {
-    const record = this.records.get(key)
-    if (record === undefined) return true
-    if (record.unavailableUntil <= now) {
-      this.records.delete(key)
-      return true
+    return this.record(key, now) === undefined
+  }
+
+  /** Live cooldown of a member, including the account-wide record, if any. */
+  memberCooldown(provider: ProviderId, account: string, model: string, now = Date.now()):
+    { until: number; reason: string; scope: PoolFailureScope } | undefined {
+    const accountRecord = this.record(accountKey(provider, account), now)
+    const memberRecord = this.record(memberKey(provider, account, model), now)
+    if (accountRecord === undefined && memberRecord === undefined) return undefined
+    if (memberRecord !== undefined && (accountRecord === undefined || memberRecord.unavailableUntil > accountRecord.unavailableUntil)) {
+      return { until: memberRecord.unavailableUntil, reason: memberRecord.reason, scope: 'member' }
     }
-    return false
+    return { until: accountRecord!.unavailableUntil, reason: accountRecord!.reason, scope: 'account' }
+  }
+
+  private record(key: string, now: number): HealthRecord | undefined {
+    const record = this.records.get(key)
+    if (record !== undefined && record.unavailableUntil <= now) {
+      this.records.delete(key)
+      return undefined
+    }
+    return record
   }
 
   /** Park a member for `cooldownMs`; a longer existing cooldown wins. */

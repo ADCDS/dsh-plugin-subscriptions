@@ -12,6 +12,8 @@ import { LlmError } from '@deepseek-ai/dsh-llm'
 import {
   accountKey,
   AUTH_COOLDOWN_MS,
+  CODEX_BURST_COOLDOWN_MS,
+  CODEX_TRANSIENT_COOLDOWN_MS,
   classifyPoolFailure,
   DEFAULT_QUOTA_COOLDOWN_MS,
   memberKey,
@@ -31,6 +33,24 @@ test('classifyPoolFailure: quota and rate-limit cool the whole account (account-
     cooldownMs: DEFAULT_QUOTA_COOLDOWN_MS,
     reason: 'RATE_LIMIT',
     scope: 'account',
+  })
+})
+
+test('classifyPoolFailure: bare Codex 429 gets a short burst cooldown, but disclosed resets win', () => {
+  assert.deepEqual(classifyPoolFailure(new LlmError('burst', 'RATE_LIMIT', { status: 429 }), 'codex'), {
+    action: 'switch', cooldownMs: CODEX_BURST_COOLDOWN_MS, reason: 'CODEX_BURST_429', scope: 'account',
+  })
+  assert.deepEqual(classifyPoolFailure(new LlmError('window', 'RATE_LIMIT', { status: 429, providerRetryAfterMs: 6_000_000 }), 'codex'), {
+    action: 'switch', cooldownMs: 6_000_000, reason: 'RATE_LIMIT', scope: 'account',
+  })
+  assert.deepEqual(classifyPoolFailure(new LlmError('quota', 'QUOTA'), 'codex'), {
+    action: 'switch', cooldownMs: DEFAULT_QUOTA_COOLDOWN_MS, reason: 'QUOTA', scope: 'account',
+  })
+})
+
+test('classifyPoolFailure: Codex server failures retry after a short member cooldown', () => {
+  assert.deepEqual(classifyPoolFailure(new LlmError('overloaded', 'SERVER', { status: 503 }), 'codex'), {
+    action: 'switch', cooldownMs: CODEX_TRANSIENT_COOLDOWN_MS, reason: 'SERVER', scope: 'member',
   })
 })
 
@@ -77,7 +97,7 @@ test('classifyPoolFailure: auth failures park the account until re-login', () =>
 
 test('classifyPoolFailure: transient server failures cool the member briefly', () => {
   for (const code of ['SERVER', 'TIMEOUT']) {
-    assert.deepEqual(classifyPoolFailure(new LlmError('oops', code), 'codex'), {
+    assert.deepEqual(classifyPoolFailure(new LlmError('oops', code), 'claude'), {
       action: 'switch',
       cooldownMs: TRANSIENT_COOLDOWN_MS,
       reason: code,

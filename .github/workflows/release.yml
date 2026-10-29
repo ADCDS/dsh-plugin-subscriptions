@@ -28,6 +28,7 @@ concurrency:
 
 jobs:
   publish:
+    if: github.repository == 'V1ki/dsh-plugin-subscriptions'
     name: Build, test, and publish to npm
     runs-on: ubuntu-latest
     timeout-minutes: 20

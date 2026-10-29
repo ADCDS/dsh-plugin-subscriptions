@@ -11,6 +11,7 @@ import { ProviderSettingsStore, validatePreferences } from '../src/provider-sett
 import { PoolAdapter } from '../src/providers/pool.js'
 import { PoolHealthRegistry } from '../src/providers/pool-health.js'
 import { PoolUsageTracker } from '../src/providers/pool-usage.js'
+import './keep-alive.js'
 
 class Raw extends LlmAdapter {
   calls: string[] = []
@@ -178,7 +179,7 @@ test('singleton and explicit families/tiers enforce account and model exclusion 
     const route = new AccountPreferencesAdapter({ provider: 'codex', adapter: raw, settings, accounts: async () => accounts, pool: () => pool })
     await settings.set('codex', { accounts: { a: { poolModels: [] } } })
     await assert.rejects(consume(route, 'm:/模型'), /No eligible/)
-    pool = new PoolAdapter({ adapters: { codex: route.poolMember() }, health: new PoolHealthRegistry(), usage: new PoolUsageTracker(() => undefined), strategy: 'priority', switchMargin: 2, defaultAccount: async () => 'a', families: async () => new Map([['codex/m:/模型', { members: [{ provider: 'codex', account: 'a', model: 'm:/模型' }] }]]), tiers: { tier: [{ provider: 'codex', model: 'm:/模型' }] }, onWarn: () => {} })
+    pool = new PoolAdapter({ adapters: { codex: route.poolMember() }, health: new PoolHealthRegistry(), usage: new PoolUsageTracker(() => undefined), strategy: 'priority', switchMargin: 2, defaultAccount: async () => 'a', families: async () => new Map([['codex/m:/模型', { members: [{ provider: 'codex', account: 'a', model: 'm:/模型' }] }]]), tiers: { tier: [{ provider: 'codex', model: 'm:/模型' }] }, onWarn: () => {}, retryDelay: async (_delay, signal) => { signal?.throwIfAborted() } })
     for (const id of ['m:/模型', 'tier']) {
       await assert.rejects(consume(route, id))
       await assert.rejects(route.resolveModel('codex', id), /no usable member/)

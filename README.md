@@ -90,6 +90,10 @@ Image generation and editing share same-provider account scheduling: try the def
 
 DSH peers use two short ranges with no upper bound: `>=0.2.0-rc.2 || >=0.2.1-0`. The first retains the minimum supported version; the second admits all `0.2.1` alpha/RC builds under npm/pnpm's default peer matching, avoiding version-mismatch warnings from these five DSH peers for that release line. Maintain one prerelease anchor per supported release line, not an entry for every RC. Development dependencies remain pinned to `0.2.1-rc.2`.
 
+This fork pins its development dependencies to DSH `0.2.2-alpha.2`, Cordis `4.0.6-alpha.1` and Schemastery `3.18.6-alpha.1`, the release it is tested and deployed with, and also admits those Cordis and Schemastery prereleases as peers. DSH itself admits the plugin on `0.2.2` prereleases because its admission check matches with `includePrerelease`; npm/pnpm's default peer matching may still warn about the five DSH peers there. It handles request-only messages, first-class tool results, preparing tool views, and offloaded image placeholders while retaining legacy history translation.
+
+Experimental macOS computer use is unsupported with Claude and pools that may select Claude: the adapter resizes large screenshots without reporting the resized dimensions to the host, so screenshot coordinates can be incorrect.
+
 Harness uses `includePrerelease: true` and admits all versions at or above the minimum, including future prereleases. npm/pnpm default matching admits later stable versions but requires an explicit prerelease anchor for each new release line (for example, `>=0.2.2-0` for `0.2.2` prereleases). There is no upper bound: future incompatible releases are not blocked, and admission does not guarantee runtime compatibility.
 
 In DSH `0.2.1-rc.2`, the load-time check uses `engines.dsh` when declared; otherwise, every `@deepseek-ai/dsh` and `@deepseek-ai/dsh-*` peer must match the running DSH version. Prereleases participate in this check. This plugin does not declare `engines.dsh`, so its DSH peer ranges determine whether it can load. The `@deepseek-ai/cordis` and `@deepseek-ai/schemastery` peers affect package-manager dependency resolution, not this load-time check. They keep their `^4.0.1` / `^3.18.1` floors and also list the `4.0.5-alpha` / `3.18.5-alpha` builds bundled with DSH `0.2.1-alpha.2` and `0.2.1-alpha.3`, because those caret ranges exclude these prereleases under npm's default semver rules.
@@ -285,7 +289,7 @@ Only a signal that names the window which actually rejected the request is read:
 
 Reading is confined to a 429. Every other failure keeps its short local backoff: those same headers ride a transient 500 too, and honouring them there would hold a turn for the rest of the window over an overload that clears in a second.
 
-With a pool, this is what actually does the waiting: a 429'd account is parked until its own disclosed reset and the request fails over to another account of the same provider immediately — no wait, no lost turn. Only once **every** account (the whole pool) is cooling down does the adapter report a `RATE_LIMIT` carrying the pool's *earliest* reset as the wait to take. With a single account (no pool, or a provider with only one login), that same disclosed reset is reported directly.
+With a pool, a 429'd account is parked until its disclosed reset and the request immediately fails over to another account. If Codex sends HTTP 429 **without** a parseable reset or `retry-after`, it may be a burst throttle even when the usage endpoint shows quota left: that account cools for two seconds instead of the generic five-minute fallback. Codex pre-output server/timeout/empty-stream failures likewise cool a member for two seconds. The pool makes up to **20 request rounds** for recoverable pre-output failures, with progressive backoff of 2, 4, 8, 16, then at most 20 seconds between rounds. A transient member can recover while a different account remains under a long rate-limit reset; the latter is never probed early. Caller cancellation ends the wait, and no failover or retry occurs after the first stream chunk. A disclosed long reset is never shortened or re-probed early. The terminal error lists numbered member cooldown reasons and HTTP status of the last failure, without account identifiers or raw upstream response bodies; it no longer labels a solely authentication/transient failure as `RATE_LIMIT`. Pool exhaustion with a disclosed reset reports the earliest time an account and its model member are both available. With no pool, the provider's disclosed reset is reported directly.
 
 Waiting on that reported delay is executed by [`@deepseek-ai/dsh-llm-retry`](https://www.npmjs.com/package/@deepseek-ai/dsh-llm-retry), which every route's retry policy is written for: add it to the composition, or nothing waits and a closed window fails the turn as before (falling back to whichever other pool accounts are healthy, if any).
 
@@ -314,6 +318,28 @@ DSH `v0.1.3-alpha.1` introduces host-managed proxy routing. Prefer configuring `
 The optional plugin override remains available for supported older DSH hosts and subscription-only routing. Every subscription request — token exchanges, model-API streams, usage lookups, model discovery, and the `web_search` / `x_search` / `image_generate` / `video_generate` tools — can use it. Configure it in **Settings → Subscriptions → Proxy → Configure…**: enable the flag, enter the proxy URL (`http://127.0.0.1:7890`), optional username/password, and an optional comma-separated bypass list (`127.0.0.1`, `localhost`, `*.example.com`). Disabled or bypassed requests use DSH's global fetch routing, **not necessarily a direct connection**; use the host's `NO_PROXY` when direct routing is required. The password is stored in `~/.dsh/plugins/subscriptions/proxy.json` (mode 0600) and is never returned to the browser. A "Test" button probes one endpoint through the current configuration and shows the HTTP status/latency.
 
 Changes apply immediately to subsequent requests — no restart needed. The OAuth authorization page opens in your browser and follows the browser/system proxy, not this setting. SOCKS proxies are not supported.
+
+## Usage feed
+
+Local tools (status bars, Stream Deck and other hardware displays) cannot use the Settings page's usage endpoint: it sits behind the dsh web session cookie, which only a browser holds. The optional usage feed serves the same data on a separate loopback HTTP server:
+
+```yaml
+- id: llm-subscriptions
+  config:
+    usageFeed:
+      enabled: true      # off by default
+      host: 127.0.0.1    # loopback only; anything else fails at load
+      port: 8771
+```
+
+```sh
+curl -H "Authorization: Bearer $(cat ~/.dsh/plugins/subscriptions/usage-feed.token)" \
+  http://127.0.0.1:8771/usage
+```
+
+`GET /usage` returns every logged-in account of each configured provider with its usage windows (`kind`, optional model `scope`, `usedPercent`, `resetsAt` in epoch milliseconds), plan name and account label. It never returns credentials. An account whose lookup fails carries an `error` field instead of `usage`, so one account never fails the whole response.
+
+The feed reads through the same usage path as the Settings page, including the pool's five-minute cache and its rate-limit cooldown, so polling it frequently adds no upstream traffic. The bearer token is generated on first start into `~/.dsh/plugins/subscriptions/usage-feed.token` (mode 0600); delete the file and restart to rotate it. Requests carrying an `Origin` header are refused, so a web page cannot read the feed.
 
 ## Related plugins
 

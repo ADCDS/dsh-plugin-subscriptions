@@ -45,6 +45,23 @@ test('quotaFor: a 429 with retry-after is cached — the second call within the 
   assert.equal(calls.count, 1, 'the cooling-down failure must not be retried')
 })
 
+test('stream quota invalidation preserves a usage endpoint negative cooldown', async () => {
+  const error = new OAuthEndpointError('usage HTTP 429', 429, undefined, 60_000)
+  const { tracker, calls } = trackerOf(() => Promise.reject(error))
+  await tracker.quotaFor(MEMBER)
+  tracker.invalidateSnapshot('claude', 'a1')
+  await tracker.quotaFor(MEMBER)
+  assert.equal(calls.count, 1)
+})
+
+test('stream quota invalidation refreshes a successful usage snapshot', async () => {
+  const { tracker, calls } = trackerOf(() => Promise.resolve(OK_USAGE))
+  await tracker.quotaFor(MEMBER)
+  tracker.invalidateSnapshot('claude', 'a1')
+  await tracker.quotaFor(MEMBER)
+  assert.equal(calls.count, 2)
+})
+
 test('quotaFor: a failure with no retry-after falls back to the default TTL', async () => {
   const { tracker, calls } = trackerOf(() => Promise.reject(new Error('network blip')), 50)
   await tracker.quotaFor(MEMBER)
