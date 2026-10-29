@@ -326,6 +326,8 @@ export interface AnthropicStreamEvent {
   index?: number
   message?: {
     id?: string
+    /** The model serving this message: a fallback model when a refusal was rerouted before any output. */
+    model?: string
     usage?: {
       input_tokens?: number
       output_tokens?: number
@@ -337,6 +339,10 @@ export interface AnthropicStreamEvent {
     type?: string
     id?: string
     name?: string
+    /** `fallback` blocks: the declining model, the model that continues, and why. */
+    from?: { model?: string }
+    to?: { model?: string }
+    trigger?: { type?: string; category?: string | null }
   }
   delta?: {
     type?: string
@@ -344,6 +350,13 @@ export interface AnthropicStreamEvent {
     thinking?: string
     partial_json?: string
     stop_reason?: string
+    /** Set with `stop_reason: refusal`: the classifier's policy area and explanation. */
+    stop_details?: {
+      type?: string
+      category?: string | null
+      explanation?: string | null
+      recommended_model?: string
+    } | null
   }
   usage?: { output_tokens?: number }
   error?: { type?: string; message?: string }
@@ -391,6 +404,31 @@ export function anthropicFailure(error: { type?: string; message?: string } | un
   return new LlmError(message, 'SERVER')
 }
 
+/** Failure code of a safety-classifier decline that no fallback answered; not retried, and no account is cooled. */
+export const REFUSAL_CODE = 'REFUSAL'
+
+/** Per-request options of one Anthropic stream. */
+export interface AnthropicStreamOptions {
+  /**
+   * The request carried server-side `fallbacks`: hold tool calls until the
+   * message ends, because a classifier handoff discards the declined model's.
+   */
+  holdToolCalls?: boolean
+  /** The requested model id, to tell when another model served the reply. */
+  requestedModel?: string
+}
+
+/**
+ * Which model answered when it was not the requested one. Carried on the
+ * successful `finish` chunk as `servedBy`; hosts that do not read it ignore it.
+ */
+export interface ServedBy {
+  model: string
+  reason: 'refusal-fallback'
+  from?: string
+  category?: string
+}
+
 /**
  * Push-model Anthropic SSE translator: feed each parsed event object to
  * {@link push} and collect the emitted harness StreamChunks. Block indexes
@@ -399,7 +437,17 @@ export function anthropicFailure(error: { type?: string; message?: string } | un
  * {@link LlmError}.
  */
 export class AnthropicStreamTranslator {
+  constructor(private readonly streamOptions: AnthropicStreamOptions = {}) {}
+
   private blocks = new Map<number, OpenBlock>()
+  /** Tool calls held until `message_stop`, by wire index, while a classifier handoff could still discard them. */
+  private held = new Map<number, OpenBlock>()
+  /** The model `message_start` named. */
+  private startModel: string | undefined
+  /** The handoff a `fallback` block announced. */
+  private fallback: { from?: string; to?: string; category?: string } | undefined
+  /** The classifier decline a `refusal` stop carried. */
+  private refusal: { category?: string; explanation?: string; recommended?: string } | undefined
   private nextIndex = 0
   private sawAnyBlock = false
   private pendingUsage: { inputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number } | undefined
@@ -442,6 +490,37 @@ export class AnthropicStreamTranslator {
     return `model returned a completed response with no content (${facts.join(', ')})`
   }
 
+  /** The failure text for a classifier decline that no fallback answered. */
+  private refusalMessage(): string {
+    const refusal = this.refusal ?? {}
+    const area = refusal.category ?? 'no named category'
+    const why = refusal.explanation === undefined ? '' : `: ${refusal.explanation}`
+    const retry = refusal.recommended === undefined ? '' : `; Anthropic recommends retrying on ${refusal.recommended}`
+    return `Claude declined the request (${area}${why})${retry} (${this.responseFacts().join(', ')})`
+  }
+
+  /**
+   * The model that actually answered, when it is not the requested one: a
+   * `fallback` block's target, or the model `message_start` named when sticky
+   * routing sent the turn straight to an earlier fallback.
+   */
+  private servedBy(): ServedBy | undefined {
+    if (this.fallback?.to !== undefined) {
+      return {
+        model: this.fallback.to,
+        reason: 'refusal-fallback',
+        ...this.fallback.from === undefined ? {} : { from: this.fallback.from },
+        ...this.fallback.category === undefined ? {} : { category: this.fallback.category },
+      }
+    }
+    const requested = this.streamOptions.requestedModel
+    const started = this.startModel
+    if (requested === undefined || started === undefined || started === requested || started.startsWith(`${requested}-`)) {
+      return undefined
+    }
+    return { model: started, reason: 'refusal-fallback', from: requested }
+  }
+
   /** The stop reason, output tokens and message id a terminal failure names. */
   private responseFacts(): string[] {
     return [
@@ -478,6 +557,7 @@ export class AnthropicStreamTranslator {
     switch (event.type) {
       case 'message_start': {
         if (typeof event.message?.id === 'string' && event.message.id.length > 0) this.messageId = event.message.id
+        if (typeof event.message?.model === 'string' && event.message.model.length > 0) this.startModel = event.message.model
         const usage = event.message?.usage
         if (usage !== undefined) {
           this.pendingUsage = {
@@ -504,6 +584,13 @@ export class AnthropicStreamTranslator {
             this.open(wireIndex, 'reasoning', chunks)
             break
           case 'tool_use': {
+            if (this.streamOptions.holdToolCalls === true) {
+              this.held.set(wireIndex, {
+                index: -1, kind: 'tool-call', text: '', callId: block.id ?? '',
+                ...block.name === undefined ? {} : { name: block.name },
+              })
+              break
+            }
             const opened = this.open(wireIndex, 'tool-call', chunks, block.id ?? '', block.name)
             chunks.push({
               type: 'tool-call-delta',
@@ -514,6 +601,17 @@ export class AnthropicStreamTranslator {
             })
             break
           }
+          case 'fallback':
+            // A classifier declined and another model continues. The declined
+            // model's tool calls must not run; its text stays as the context the
+            // fallback model continued from.
+            this.fallback = {
+              ...typeof block.from?.model === 'string' ? { from: block.from.model } : {},
+              ...typeof block.to?.model === 'string' ? { to: block.to.model } : {},
+              ...typeof block.trigger?.category === 'string' ? { category: block.trigger.category } : {},
+            }
+            this.held.clear()
+            break
           default:
             if (typeof block?.type === 'string') this.skippedBlockTypes.add(block.type)
             break
@@ -522,6 +620,11 @@ export class AnthropicStreamTranslator {
       }
       case 'content_block_delta': {
         const wireIndex = event.index ?? 0
+        const held = this.held.get(wireIndex)
+        if (held !== undefined) {
+          if (event.delta?.type === 'input_json_delta') held.text += event.delta.partial_json ?? ''
+          return chunks
+        }
         const block = this.blocks.get(wireIndex)
         const delta = event.delta
         if (block === undefined || delta === undefined) return chunks
@@ -561,6 +664,14 @@ export class AnthropicStreamTranslator {
       case 'message_delta': {
         if (event.usage?.output_tokens !== undefined) this.outputTokens = event.usage.output_tokens
         if (typeof event.delta?.stop_reason === 'string') this.wireStopReason = event.delta.stop_reason
+        if (event.delta?.stop_reason === 'refusal') {
+          const details = event.delta.stop_details
+          this.refusal = {
+            ...typeof details?.category === 'string' ? { category: details.category } : {},
+            ...typeof details?.explanation === 'string' && details.explanation.length > 0 ? { explanation: details.explanation } : {},
+            ...typeof details?.recommended_model === 'string' ? { recommended: details.recommended_model } : {},
+          }
+        }
         switch (event.delta?.stop_reason) {
           case 'end_turn':
           case 'stop_sequence':
@@ -588,8 +699,33 @@ export class AnthropicStreamTranslator {
           this.blocks.delete(wireIndex)
           chunks.push({ type: 'block-end', index: block.index, block: closeBlock(block) })
         }
+        // A standing refusal discards the declined model's partial tool work;
+        // otherwise no handoff can take them any more, so release them.
+        if (this.wireStopReason !== 'refusal') {
+          for (const held of this.held.values()) {
+            const opened = this.open(-1, 'tool-call', chunks, held.callId, held.name)
+            this.blocks.delete(-1)
+            opened.text = held.text
+            chunks.push({
+              type: 'tool-call-delta',
+              index: opened.index,
+              id: ToolCallId(opened.callId),
+              ...opened.name === undefined ? {} : { name: opened.name },
+              argumentsDelta: held.text,
+            })
+            chunks.push({ type: 'block-end', index: opened.index, block: closeBlock(opened) })
+          }
+        }
+        this.held.clear()
         this.emitUsage(chunks)
-        if (this.contextExceeded && !this.sawAnyBlock) {
+        if (this.wireStopReason === 'refusal') {
+          // The classifier's decline stands (no fallback, or every fallback declined).
+          // Partial output is incomplete, so the turn fails rather than ending on it.
+          chunks.push({
+            type: 'finish',
+            reason: { kind: 'error', failure: { message: this.refusalMessage(), code: REFUSAL_CODE } },
+          })
+        } else if (this.contextExceeded && !this.sawAnyBlock) {
           // Nothing fit: report the overflow, which the host answers by compacting and retrying.
           chunks.push({
             type: 'finish',
@@ -610,7 +746,9 @@ export class AnthropicStreamTranslator {
             },
           })
         } else {
-          chunks.push({ type: 'finish', reason: { kind: this.stopReason } })
+          const finish: StreamChunk = { type: 'finish', reason: { kind: this.stopReason } }
+          const servedBy = this.servedBy()
+          chunks.push(servedBy === undefined ? finish : { ...finish, servedBy } as StreamChunk)
         }
         return chunks
       }
@@ -627,13 +765,15 @@ export class AnthropicStreamTranslator {
  * Consume an Anthropic SSE byte stream and yield harness StreamChunks.
  * @param stream - raw response body.
  * @param onActivity - transport-activity callback for the idle watchdog.
+ * @param options - per-request translation options (server-side fallback).
  * @returns the chunk stream; throws when the stream ends before `message_stop`.
  */
 export async function* streamAnthropic(
   stream: ReadableStream<Uint8Array>,
   onActivity?: () => void,
+  options: AnthropicStreamOptions = {},
 ): AsyncGenerator<StreamChunk> {
-  const translator = new AnthropicStreamTranslator()
+  const translator = new AnthropicStreamTranslator(options)
   for await (const sseEvent of parseSse(stream, onActivity)) {
     let event: AnthropicStreamEvent
     try {
