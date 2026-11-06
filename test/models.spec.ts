@@ -28,6 +28,13 @@ import type { CatalogPersistence, CatalogSnapshot, FetchFn } from '../src/provid
 import type { ClaudeSession, CodexSession, CopilotSession, GrokSession } from '../src/auth/store.js'
 import { oauthEndpointError, withTimeout } from '../src/providers/common.js'
 
+declare module '@deepseek-ai/dsh-llm/types' {
+  interface LlmRequestPurposeMap {
+    'compaction': true
+    'session-title': true
+  }
+}
+
 const STATIC_CODEX = [{ id: 'gpt-5.1-codex', name: 'GPT-5.1 Codex' }]
 const STATIC_CLAUDE = [{ id: 'claude-opus-4-5', name: 'Claude Opus 4.5' }]
 const STATIC_GROK = [{ id: 'grok-4', name: 'Grok 4' }]

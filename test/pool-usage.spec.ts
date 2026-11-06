@@ -49,7 +49,7 @@ test('stream quota invalidation preserves a usage endpoint negative cooldown', a
   const error = new OAuthEndpointError('usage HTTP 429', 429, undefined, 60_000)
   const { tracker, calls } = trackerOf(() => Promise.reject(error))
   await tracker.quotaFor(MEMBER)
-  tracker.invalidateSnapshot('claude', 'a1')
+  tracker.expire('claude', 'a1')
   await tracker.quotaFor(MEMBER)
   assert.equal(calls.count, 1)
 })
@@ -57,7 +57,7 @@ test('stream quota invalidation preserves a usage endpoint negative cooldown', a
 test('stream quota invalidation refreshes a successful usage snapshot', async () => {
   const { tracker, calls } = trackerOf(() => Promise.resolve(OK_USAGE))
   await tracker.quotaFor(MEMBER)
-  tracker.invalidateSnapshot('claude', 'a1')
+  tracker.expire('claude', 'a1')
   await tracker.quotaFor(MEMBER)
   assert.equal(calls.count, 2)
 })

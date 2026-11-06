@@ -232,8 +232,6 @@ export interface ResponsesStreamEvent {
     error?: { code?: string; message?: string; headers?: unknown } | null
     incomplete_details?: { reason?: string }
   }
-  /** Detail of an `error` event; the ChatGPT backend nests it here, as the Codex CLI reads it. */
-  error?: { code?: string; message?: string; type?: string } | null
   code?: string
   message?: string
   /**
@@ -242,7 +240,7 @@ export interface ResponsesStreamEvent {
    * `code`/`message` above stay for the flat shape Copilot and some gateways
    * emit, so read both.
    */
-  error?: { code?: string; message?: string; headers?: unknown }
+  error?: { code?: string; message?: string; type?: string; headers?: unknown } | null
 }
 
 /** Responses `usage` object shape. */

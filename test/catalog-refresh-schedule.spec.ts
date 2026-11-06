@@ -14,6 +14,8 @@ import { createFakeConnection } from './fake-connection.js'
 import * as plugin from '../src/index.js'
 
 const settle = () => new Promise(resolve => setImmediate(resolve))
+/** Captured before any test mocks timers, to wait on real file I/O. */
+const realSetTimeout = setTimeout
 const now = 1_800_000_000_000
 
 function saved(ageMs: number) {
@@ -131,7 +133,10 @@ test('registered plugin refreshes at startup and hourly, while menus and disposa
     await saveAccountSession('codex', 'c', { accessToken: 'c', refreshToken: 'c', expiresAt: now + 86_400_000, accountId: 'c' })
     await catalogStore('codex').save({ at: now - 360_000, models: [{ id: 'cached', name: 'Cached', contextWindow: 1000 }] })
     runtime = ctx.plugin(plugin, { providers: ['codex'] })
-    for (let i = 0; i < 500 && requests === 0; i++) await settle()
+    // Startup reads the auth and catalog stores, real file I/O that no count of
+    // event loop turns can bound on a loaded runner.
+    const startupDeadline = performance.now() + 10_000
+    while (requests === 0 && performance.now() < startupDeadline) await new Promise(resolve => realSetTimeout(resolve, 5))
     assert.equal(requests, 1, 'plugin startup must schedule discovery without opening a menu')
     for (let i = 0; i < 30; i++) await settle()
     t.mock.timers.tick(6 * 60_000)
@@ -141,15 +146,14 @@ test('registered plugin refreshes at startup and hourly, while menus and disposa
     }
     assert.equal(requests, 1, 'six-minute-old cached menu reads do not fetch')
     t.mock.timers.tick(54 * 60_000)
-    for (let i = 0; i < 500 && requests < 2; i++) await settle()
     // The hour is counted from when the job's first run COMPLETES, and that
-    // run does real file I/O (auth and catalog stores) the fixed settle
-    // budget above cannot bound on a loaded CI runner; if it finished during
-    // the six-minute menu-read window the timer lands a few minutes past the
-    // hour. Allow that bounded slack instead of a second full hour.
-    for (let extra = 0; extra < 10 && requests < 2; extra++) {
+    // run does real file I/O (auth and catalog stores) that no count of event
+    // loop turns can bound on a loaded runner. Keep advancing the mock clock
+    // against a real-time deadline until the timer the run armed fires.
+    const deadline = performance.now() + 10_000
+    while (requests < 2 && performance.now() < deadline) {
       t.mock.timers.tick(60_000)
-      for (let i = 0; i < 50 && requests < 2; i++) await settle()
+      await new Promise(resolve => realSetTimeout(resolve, 5))
     }
     assert.equal(requests, 2, 'the hourly job must actually be registered by the plugin')
     await runtime.dispose()

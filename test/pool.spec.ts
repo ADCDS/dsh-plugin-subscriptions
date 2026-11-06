@@ -577,7 +577,8 @@ test('quota_aware: fallback failure never falls through to a known exhausted acc
     'codex/a2': windowUsage(95, 60_000),
   }) })
   await assert.rejects(collect(pool.stream(OPTIONS)))
-  assert.deepEqual(codex.accounts, ['a2'])
+  // Codex retries a transient a2 failure across its rounds; a1 is never tried.
+  assert.deepEqual(codex.accounts, Array<string>(20).fill('a2'))
 })
 
 test('quota_aware: an account without telemetry sinks behind a measured one', async () => {
@@ -799,7 +800,9 @@ test('stream: empty completions in one session do not stall another session', as
   })
   const chunks = await collect(pool.stream({ ...OPTIONS, sessionId: SessionId('healthy') }))
   assert.equal((chunks[0] as { text: string }).text, 'a1')
-  assert.deepEqual(codex.accounts, ['a1', 'a2', 'a1'])
+  // Twenty Codex rounds over both members, then the healthy session's one request.
+  assert.equal(codex.accounts.length, 41)
+  assert.equal(codex.accounts.at(-1), 'a1')
 })
 
 for (const strategy of ['priority', 'quota_aware', 'quota_normalized'] as const) test(`stream: ${strategy} gives no wait when the member with an empty completion can retry at once`, async () => {
@@ -807,7 +810,8 @@ for (const strategy of ['priority', 'quota_aware', 'quota_normalized'] as const)
     let empties = 0
     const codex = new FakeAdapter((_options, account) => {
       if (account === 'a1') return serveFail(new LlmError('usage limit', 'RATE_LIMIT', { providerRetryAfterMs: limitMs }))
-      return empties++ === 0
+      // Empty on every Codex round of the first request, so that request exhausts.
+      return empties++ < 20
         ? serveFail(new LlmError('model returned a completed response with no content', 'EMPTY_RESPONSE'))
         : serveOk(account)
     })
@@ -821,7 +825,7 @@ for (const strategy of ['priority', 'quota_aware', 'quota_normalized'] as const)
     assert.equal(health.isMemberAvailable('codex', 'a2', 'm'), true)
     const chunks = await collect(pool.stream(OPTIONS))
     assert.equal((chunks[0] as { text: string }).text, 'a2')
-    assert.deepEqual(codex.accounts, ['a1', 'a2', 'a2'])
+    assert.deepEqual(codex.accounts, ['a1', ...Array<string>(21).fill('a2')])
   }
 })
 
