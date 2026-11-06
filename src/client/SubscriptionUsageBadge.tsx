@@ -28,7 +28,8 @@ import { createPortal } from 'react-dom'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type { ConnectionHandle } from '@deepseek-ai/dsh-api-remotes/client'
 import * as primitives from '@deepseek-ai/dsh-client-ui-primitives'
-import { useAnchoredPosition, useDismissOnOutsidePointer } from '@deepseek-ai/dsh-client-ui-primitives'
+import { useDismissOnOutsidePointer } from '@deepseek-ai/dsh-client-ui-primitives'
+import { useAnchoredPanel } from './anchored-panel.js'
 import { callSubscriptionsAuth, usageBarColor } from './SubscriptionsSection.js'
 import type { AccountStatus, ProviderStatus, ProviderUsage, SubscriptionProvider, UsageWindow } from './SubscriptionsSection.js'
 import type { ModelDirectoriesLike } from './SpeedSelect.js'
@@ -427,7 +428,7 @@ export function SubscriptionUsageBadge({ rpc, currentModel, t }: SubscriptionUsa
     }
   }, [])
 
-  const pos = useAnchoredPosition({ open, anchorRef: rootRef, panelRef, side: 'top', gap: PANEL_GAP, margin: PANEL_MARGIN })
+  const pos = useAnchoredPanel({ open, anchorRef: rootRef, panelRef, gap: PANEL_GAP, margin: PANEL_MARGIN })
   useDismissOnOutsidePointer(rootRef, open, setOpen, panelRef)
   useEffect(() => {
     if (!open) return
@@ -624,7 +625,7 @@ function WindowRow({ label, window: w }: { label: string; window: UsageWindow })
 
 /**
  * Unplaced portal panel: hidden but laid out so the clamp measures real
- * dimensions (the `useAnchoredPosition` measure pass).
+ * dimensions (the `useAnchoredPanel` measure pass).
  */
 const MEASURE_STYLE: CSSProperties = { visibility: 'hidden', left: 0, top: 0 }
 
